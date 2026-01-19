@@ -34,6 +34,9 @@ chpasswd:
   expire: false
   list: |
     debian:${DEBIAN_PASSWORD}
+preserve_hostname: false
+hostname: debian-vm
+fqdn: debian-vm.local
 EOF
 
 if command -v uuidgen >/dev/null 2>&1; then
