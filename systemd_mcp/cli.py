@@ -26,6 +26,7 @@ TOOL_REGISTRY = {
     "get_service_status": server.get_service_status,
     "read_journal_logs": server.read_journal_logs,
     "restart_service": server.restart_service,
+    "get_uptime": server.get_uptime,
 }
 
 TOOL_SPEC = [
@@ -86,6 +87,14 @@ TOOL_SPEC = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_uptime",
+            "description": "Retrieve the current system uptime string.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -101,8 +110,8 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "-m",
         "--model",
-        default="llama3",
-        help="Ollama model name to use (default: llama3).",
+        default="qwen3:latest",
+        help="Ollama model name to use (default: qwen3:latest).",
     )
     parser.add_argument(
         "--host",

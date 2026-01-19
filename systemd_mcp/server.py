@@ -31,6 +31,12 @@ def restart_service(service_name: str):
     return f"Restart command sent for {service_name}"
 
 
+@mcp.tool()
+def get_uptime():
+    """Return the system uptime string."""
+    return _run_ssh_cmd("uptime")
+
+
 def main():
     """Start the FastMCP server."""
     mcp.run()
