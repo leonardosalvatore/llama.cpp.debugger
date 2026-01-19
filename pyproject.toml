@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "systemd_mcp"
+version = "0.1.0"
+description = "a FastMCP server exposing  systemd and other linux API/tools"
+authors = ["AI Summit <leonardo_salvatore@trimble.com>"]
+readme = "README.md"
+packages = [{ include = "systemd_mcp" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+fastmcp = "<3"
+paramiko = "*"
+
+[tool.poetry.scripts]
+mcp-systemd-server = "systemd_mcp:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
