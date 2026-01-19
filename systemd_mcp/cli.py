@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
+from uuid import uuid4
 
 try:  # Ollama 0.1.0+ exports ResponseError, earlier versions keep it internal
     from ollama import Client, ResponseError
@@ -27,6 +28,7 @@ TOOL_REGISTRY = {
     "read_journal_logs": server.read_journal_logs,
     "restart_service": server.restart_service,
     "get_uptime": server.get_uptime,
+    "localhost_get_uptime": server.localhost_get_uptime,
 }
 
 TOOL_SPEC = [
@@ -95,6 +97,14 @@ TOOL_SPEC = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "localhost_get_uptime",
+            "description": "Retrieve the host machine uptime without SSH.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -115,7 +125,7 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--host",
-        default=None,
+        default="localhost",
         help="Override Ollama host URL (defaults to environment configuration).",
     )
     parser.add_argument(
@@ -150,11 +160,45 @@ def _invoke_tool(call: Dict[str, Any]) -> str:
     if name not in TOOL_REGISTRY:
         return f"Unsupported tool requested: {name}"
     arguments = _decode_arguments(call.get("function", {}).get("arguments"))
+    tool = TOOL_REGISTRY[name]
+    callable_tool = getattr(tool, "fn", None)
+    if callable_tool is None:
+        callable_tool = getattr(tool, "function", None)
+    if callable_tool is None:
+        callable_tool = tool
     try:
-        result = TOOL_REGISTRY[name](**arguments)
+        result = callable_tool(**arguments)
     except Exception as exc:  # noqa: BLE001 - we surface tool failures to the model
         return f"Tool execution failed: {exc}"
+    if not isinstance(result, str):
+        result = str(result)
     return result
+
+
+def _parse_fallback_tool_call(content: str) -> Optional[Dict[str, Any]]:
+    payload = content.strip()
+    if not payload:
+        return None
+    start = payload.find("{")
+    end = payload.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    snippet = payload[start : end + 1]
+    try:
+        data = json.loads(snippet)
+    except json.JSONDecodeError:
+        return None
+    name = data.get("name")
+    if not name:
+        return None
+    arguments = data.get("arguments", {})
+    return {
+        "id": f"fallback-{uuid4().hex}",
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        },
+    }
 
 
 def _chat_once(
@@ -170,6 +214,19 @@ def _chat_once(
         message = response.get("message", {})
         messages.append(message)
         tool_calls = message.get("tool_calls") or []
+        if tool_spec and not tool_calls:
+            fallback_call = _parse_fallback_tool_call(message.get("content", ""))
+            if fallback_call:
+                tool_output = _invoke_tool(fallback_call)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": fallback_call["id"],
+                        "name": fallback_call["function"]["name"],
+                        "content": tool_output,
+                    }
+                )
+                return {"role": "assistant", "content": tool_output}
         if not tool_spec or not tool_calls:
             return message
         for call in tool_calls:
