@@ -1,41 +1,15 @@
-from fastmcp import FastMCP
-import paramiko  # For SSH into the VM
+"""systemd_mcp package entry point stubs."""
 
-mcp = FastMCP("Linux-SRE-Agent")
-
-
-def run_ssh_cmd(cmd: str) -> str:
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect("127.0.0.1", port=2222, username="root", password="password")
-    stdin, stdout, stderr = ssh.exec_command(cmd)
-    return stdout.read().decode()
+from importlib.metadata import version, PackageNotFoundError
 
 
-@mcp.tool()
-def get_service_status(service_name: str):
-    """Checks the systemd status of a service."""
-    return run_ssh_cmd(f"systemctl status {service_name}")
+def __getattr__(name: str):
+    if name == "__version__":
+        try:
+            return version("systemd_mcp")
+        except PackageNotFoundError as exc:
+            raise AttributeError("Package version unavailable") from exc
+    raise AttributeError(name)
 
 
-@mcp.tool()
-def read_journal_logs(service_name: str, lines: int = 20):
-    """Fetches the latest logs for a specific service."""
-    return run_ssh_cmd(f"journalctl -u {service_name} -n {lines} --no-pager")
-
-
-@mcp.tool()
-def restart_service(service_name: str):
-    """Attempts to restart a systemd service."""
-    run_ssh_cmd(f"systemctl restart {service_name}")
-    return f"Restart command sent for {service_name}"
-
-
-def main():
-    """Start the FastMCP server."""
-    # FastMCP typically exposes a run/serve method; using run() here.
-    mcp.run()
-
-
-if __name__ == "__main__":
-    main()
+__all__ = ["__version__"]

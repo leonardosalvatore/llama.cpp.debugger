@@ -12,7 +12,8 @@ fastmcp = "<3"
 paramiko = "*"
 
 [tool.poetry.scripts]
-mcp-systemd-server = "systemd_mcp:main"
+systemd_mcp_server = "systemd_mcp.server:main"
+systemd_mcp_cli = "systemd_mcp.cli:main"
 
 [build-system]
 requires = ["poetry-core"]
