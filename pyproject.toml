@@ -10,6 +10,7 @@ packages = [{ include = "systemd_mcp" }]
 python = ">=3.10,<3.13"
 fastmcp = "<3"
 paramiko = "*"
+ollama = "*"
 
 [tool.poetry.scripts]
 systemd_mcp_server = "systemd_mcp.server:main"
