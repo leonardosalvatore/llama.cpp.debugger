@@ -60,7 +60,7 @@ def get_all_service():
 def run_ssh_command(command: str):
     """Execute an arbitrary command over SSH."""
     print(f"[systemd_mcp] run_ssh_command(command={command!r})", file=sys.stderr, flush=True)
-    return _run_ssh_cmd(command)
+    return _run_ssh_cmd("sudo " +command)
 
 
 def main():

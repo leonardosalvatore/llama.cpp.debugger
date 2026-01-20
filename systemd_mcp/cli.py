@@ -154,8 +154,8 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "--max-tool-steps",
         type=int,
-        default=8,
-        help="Maximum chained tool invocations allowed per user turn (default: 8).",
+        default=20,
+        help="Maximum chained tool invocations allowed per user turn (default: 20).",
     )
     parser.add_argument(
         "--single",
@@ -235,6 +235,15 @@ def _chat_once(
         if tool_spec and not tool_calls:
             fallback_call = _parse_fallback_tool_call(message.get("content", ""))
             if fallback_call:
+                steps += 1
+                if steps > max_tool_steps:
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "Tool depth limit reached; unable to continue automatically.",
+                        }
+                    )
+                    return messages[-1]
                 tool_output = _invoke_tool(fallback_call)
                 messages.append(
                     {
@@ -244,7 +253,7 @@ def _chat_once(
                         "content": tool_output,
                     }
                 )
-                return {"role": "assistant", "content": tool_output}
+                continue
         if not tool_spec or not tool_calls:
             return message
         for call in tool_calls:
