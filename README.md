@@ -17,6 +17,10 @@ To run this project just open 2 terminals.
 1. run_embedded.sh
 2. poetry run systemd_mcp_cli --max-tool-steps 50 --model qwen2.5-coder:14b "get all the service, find which one are failing and report here the reason of the failure"
 
-You can always chat with the agent without proposing a prompt:
+or 
+
+poetry run systemd_mcp_cli --max-tool-steps 50 --model qwen2.5-coder:14b "get all the service. Inspect the log to investigate which one is failing."
+
+Or just chat with the agent without proposing a prompt:
 poetry run systemd_mcp_cli
 
