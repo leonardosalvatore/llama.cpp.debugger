@@ -18,8 +18,8 @@ from systemd_mcp import server
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a Linux SRE assistant. Use the available tools to manage systemd services "
-    "whenever the user asks for status checks, log reviews, or restarts."
+    "You are a Linux SRE assistant. You are interfacing to a MCP server that can run commands to a remote Linux host over SSH."
+    "It's a Debian-based system using systemd, journald, and standard Linux utilities. Any any prompt from the user needs to be solved using the available MCP tools."
 )
 
 # The CLI imports the server tools so we obey the same SSH execution path.
@@ -28,7 +28,8 @@ TOOL_REGISTRY = {
     "read_journal_logs": server.read_journal_logs,
     "restart_service": server.restart_service,
     "get_uptime": server.get_uptime,
-    "localhost_get_uptime": server.localhost_get_uptime,
+    "get_all_service": server.get_all_service,
+    "run_ssh_command": server.run_ssh_command,
 }
 
 TOOL_SPEC = [
@@ -53,13 +54,13 @@ TOOL_SPEC = [
         "type": "function",
         "function": {
             "name": "read_journal_logs",
-            "description": "Read the latest journal lines for a systemd service.",
+            "description": "Fetch journal lines for a service, or all logs if service_name is omitted.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "service_name": {
                         "type": "string",
-                        "description": "Name of the systemd unit.",
+                        "description": "Name of the systemd unit (optional).",
                     },
                     "lines": {
                         "type": "integer",
@@ -68,7 +69,7 @@ TOOL_SPEC = [
                         "maximum": 500,
                     },
                 },
-                "required": ["service_name"],
+                "required": [],
             },
         },
     },
@@ -100,9 +101,26 @@ TOOL_SPEC = [
     {
         "type": "function",
         "function": {
-            "name": "localhost_get_uptime",
-            "description": "Retrieve the host machine uptime without SSH.",
+            "name": "get_all_service",
+            "description": "List all systemd services on the target host.",
             "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_ssh_command",
+            "description": "Execute an arbitrary command over SSH and return stdout.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The shell command to execute on the remote host.",
+                    }
+                },
+                "required": ["command"],
+            },
         },
     },
 ]
@@ -110,7 +128,7 @@ TOOL_SPEC = [
 
 def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Chat with the systemd MCP server through an Ollama-hosted llama3 model."
+        description="Chat with the systemd MCP server through an Ollama-hosted qwen2.5-coder model."
     )
     parser.add_argument(
         "prompt",
@@ -120,8 +138,8 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "-m",
         "--model",
-        default="qwen3:latest",
-        help="Ollama model name to use (default: qwen3:latest).",
+        default="qwen2.5-coder:latest",
+        help="Ollama model name to use (default: qwen2.5-coder:latest).",
     )
     parser.add_argument(
         "--host",

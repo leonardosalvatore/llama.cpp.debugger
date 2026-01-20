@@ -22,21 +22,23 @@ def get_service_status(service_name: str):
 
 
 @mcp.tool()
-def read_journal_logs(service_name: str, lines: int = 20):
-    """Fetch the latest journal lines for the given service."""
+def read_journal_logs(service_name: str | None = None, lines: int = 20):
+    """Fetch journal lines for a service, or for all if service_name is omitted."""
     print(
         f"[systemd_mcp] read_journal_logs({service_name}, lines={lines})",
         file=sys.stderr,
         flush=True,
     )
-    return _run_ssh_cmd(f"journalctl -u {service_name} -n {lines} --no-pager")
+    if service_name:
+        return _run_ssh_cmd(f"journalctl -u {service_name} -n {lines} --no-pager")
+    return _run_ssh_cmd(f"journalctl -n {lines} --no-pager")
 
 
 @mcp.tool()
 def restart_service(service_name: str):
     """Restart the given systemd service."""
     print(f"[systemd_mcp] restart_service({service_name})", file=sys.stderr, flush=True)
-    _run_ssh_cmd(f"systemctl restart {service_name}")
+    _run_ssh_cmd(f"sudo systemctl restart {service_name}")
     return f"Restart command sent for {service_name}"
 
 
@@ -46,18 +48,19 @@ def get_uptime():
     print("[systemd_mcp] get_uptime()", file=sys.stderr, flush=True)
     return _run_ssh_cmd("uptime")
 
+
 @mcp.tool()
-def localhost_get_uptime():
-    """Return the localhost system uptime string without going via SSH."""
-    print("[systemd_mcp] localhost_get_uptime()", file=sys.stderr, flush=True)
-    import os
-    with open("/proc/uptime", "r") as f:
-        uptime_seconds = float(f.readline().split()[0])
-    hours, remainder = divmod(int(uptime_seconds), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"Uptime: {hours} hours, {minutes} minutes, {seconds} seconds"
+def get_all_service():
+    """List all systemd services."""
+    print("[systemd_mcp] get_all_service()", file=sys.stderr, flush=True)
+    return _run_ssh_cmd("systemctl list-units --type=service --all --no-pager")
 
 
+@mcp.tool()
+def run_ssh_command(command: str):
+    """Execute an arbitrary command over SSH."""
+    print(f"[systemd_mcp] run_ssh_command(command={command!r})", file=sys.stderr, flush=True)
+    return _run_ssh_cmd(command)
 
 
 def main():
