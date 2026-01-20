@@ -37,6 +37,28 @@ chpasswd:
 preserve_hostname: false
 hostname: debian-vm
 fqdn: debian-vm.local
+
+write_files:
+  - path: /lib/systemd/system/test.service
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Test Service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/bash -c "sleep 1 && exit 1"
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl enable test.service
+  - systemctl restart test.service || true
+
 EOF
 
 if command -v uuidgen >/dev/null 2>&1; then
