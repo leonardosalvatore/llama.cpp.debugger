@@ -18,8 +18,8 @@ from systemd_mcp import server
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a Linux SRE assistant. You are interfacing to a MCP server that can run commands to a remote Linux host over SSH."
-    "It's a Debian-based system using systemd, journald, and standard Linux utilities. Any any prompt from the user needs to be solved using the available MCP tools."
+    "You are a Linux SRE assistant. You are interfacing to an MCP server that can run commands to a remote Linux host over SSH. "
+    "It's a Debian-based system using systemd, journald, and standard Linux utilities. Any prompt from the user should be solved using the available MCP tools."
 )
 
 # The CLI imports the server tools so we obey the same SSH execution path.
@@ -143,8 +143,8 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--host",
-        default="localhost",
-        help="Override Ollama host URL (defaults to environment configuration).",
+        default="",
+        help="Override Ollama host URL (otherwise uses environment defaults).",
     )
     parser.add_argument(
         "--system",
@@ -201,7 +201,7 @@ def _parse_fallback_tool_call(content: str) -> Optional[Dict[str, Any]]:
     end = payload.rfind("}")
     if start == -1 or end == -1 or end <= start:
         return None
-    snippet = payload[start : end + 1]
+    snippet = payload[start:end + 1]
     try:
         data = json.loads(snippet)
     except json.JSONDecodeError:
@@ -288,7 +288,7 @@ def main(argv: Iterable[str] | None = None) -> None:
     client = Client(host=args.host) if args.host else Client()
 
     messages: List[Dict[str, Any]] = [{"role": "system", "content": args.system}]
-    interactive = not args.single or not args.prompt
+    interactive = not args.single
     tool_support = True
 
     def chat_with_fallback() -> Dict[str, Any]:
