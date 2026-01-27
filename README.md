@@ -1,7 +1,7 @@
 This is a sinmple MCP demo that show how to control some embedded linux systemd based system.
 
 **server.py**
-The MCP server that expose some basic linux and systemd functions.
+The MCP server that expose some basic linux and systemd functions. This to use Ollama and our new tools with any other MCP compatible application.
 
 **cli.py**
 The Ollama terminal client that will reach the MCP server.
@@ -15,12 +15,9 @@ It also inject some configuration for ssh and create a service file that is fail
 
 To run this project just open 2 terminals.
 1. run_embedded.sh
-2. poetry run systemd_mcp_cli --max-tool-steps 50 --model qwen2.5-coder:14b "get all the service, find which one are failing and report here the reason of the failure"
-
-or 
-
-poetry run systemd_mcp_cli --max-tool-steps 50 --model qwen2.5-coder:14b "get all the service. Inspect the log to investigate which one is failing."
+2. poetry run systemd_mcp_cli --max-tool-steps 50 --model qwen3:latest "get all the service. Inspect the log to investigate which one is failing."~
 
 Or just chat with the agent without proposing a prompt:
 poetry run systemd_mcp_cli
+
 
