@@ -25,11 +25,9 @@ To use the Debian shell, press Enter and log in with user: debian / password: de
 1. Init
 It's a Poetry project, so run: `poetry sync`.
 To run this project, open 2 terminals.
-2. Run:
-`poetry run systemd_mcp_cli --model qwen3:latest "get all the services. Inspect the logs to investigate which one is failing."`
+2. Run:  `poetry run systemd_mcp_cli --model qwen3:latest "Is ths SUT running fine without any failure`
 
-Or just chat with the agent without a prompt:
-`poetry run systemd_mcp_cli`
+Or just chat with the agent without a prompt: `poetry run systemd_mcp_cli`
 
 To stop QEMU, run:
 `killall qemu-system-x86_64`

@@ -12,8 +12,8 @@ from ollama import chat
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a helpful assistant. Answer the user's questions clearly and concisely. "
-    "You are interfacing to Debian Ollama tools that will let access to systemd, journald, "
+    "You are a helpful assistant. Answer the user's concisely. "
+    "The user will ask you to work on a SUT (system under test, is a Debian linux OS), you are interfacing to it with tools that will let access to systemd, journald, "
     "and standard Linux utilities. Any prompt from the user should be solved using the available tools."
 )
 
@@ -50,7 +50,7 @@ TOOL_SPEC = [
                     },
                     "lines": {
                         "type": "integer",
-                        "description": "Number of log lines to return (default 20).",
+                        "description": "Number of log lines to return (default 50).",
                         "minimum": 1,
                         "maximum": 500,
                     },
@@ -127,7 +127,7 @@ def get_service_status(service_name: str) -> str:
     return _run_ssh_cmd(f"systemctl status --no-pager {service_name}")
 
 
-def read_journal_logs(service_name: str | None = None, lines: int = 20) -> str:
+def read_journal_logs(service_name: str | None = None, lines: int = 50) -> str:
     if service_name:
         return _run_ssh_cmd(f"journalctl -u {service_name} -n {lines} --no-pager")
     return _run_ssh_cmd(f"journalctl -n {lines} --no-pager")
@@ -272,7 +272,7 @@ def _run_turn(
                 print()
             break
         for call in tool_calls:
-            name, _ = _extract_call_name_args(call)
+            name, _args = _extract_call_name_args(call)
             result = _invoke_tool(call, registry)
             messages.append(
                 {
@@ -305,7 +305,7 @@ def main(argv: Iterable[str] | None = None) -> None:
 
     while True:
         try:
-            user_input = input("you> ")
+            user_input = input("\nyou> ")
         except EOFError:
             print()
             break
