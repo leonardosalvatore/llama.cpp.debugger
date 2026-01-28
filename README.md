@@ -26,6 +26,8 @@ To use the Debian shell, press Enter and log in with user: debian / password: de
 It's a Poetry project, so run: `poetry sync`.
 To run this project, open 2 terminals.
 2. Run:  `poetry run systemd_mcp_cli --model qwen3:latest "Is ths SUT running fine without any failure`
+3. Try with smaller model
+`poetry run systemd_mcp_cli --model qwen3:0.6b "Is ths SUT running fine without any failure`
 
 Or just chat with the agent without a prompt: `poetry run systemd_mcp_cli`
 
