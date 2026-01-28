@@ -2,10 +2,12 @@ This is a sinmple MCP demo that show how to control some embedded linux systemd 
 
 **cli.py**
 The Ollama terminal client that will expose the functions to the Ollama LLM model.
+It does use the Ollama directly so does not require anything else. 
 
 
 **server.py**
-The MCP server that expose some basic linux and systemd functions. 
+The MCP server that expose some basic linux and systemd functions.
+Can be used with any "AI" tool that talk MCP protocol. 
 
 
 **run_embedded.sh**
@@ -20,8 +22,7 @@ To use this Debian bash just press enter and enter with user:debian psw:debian
 1. Init
 it's a poetry project so run -poetry sync-
 To run this project just open 2 terminals.
-1. run_embedded.sh
-2. poetry run systemd_mcp_cli --max-tool-steps 50 --model qwen3:latest "get all the service. Inspect the log to investigate which one is failing."
+2. run_empoetry run systemd_mcp_cli --model qwen3:latest "get all the service. Inspect the log to investigate which one is failing."
 
 Or just chat with the agent without proposing a prompt:
 `poetry run systemd_mcp_cli`

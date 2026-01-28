@@ -1,36 +1,22 @@
-"""Command line interface for interacting with the systemd MCP server via Ollama."""
+"""Command line interface for chatting with an Ollama model."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
-from typing import Any, Dict, Iterable, List, Optional
-from uuid import uuid4
+from typing import Any, Callable, Dict, Iterable, List
 
-try:  # Ollama 0.1.0+ exports ResponseError, earlier versions keep it internal
-    from ollama import Client, ResponseError
-except ImportError:  # pragma: no cover - fallback for older ollama packages
-    from ollama import Client  # type: ignore
-    from ollama._types import ResponseError  # type: ignore
-
-from systemd_mcp import server
+import paramiko
+from ollama import chat
 
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are a Linux SRE assistant. You are interfacing to an MCP server that can run commands to a remote Linux host over SSH. "
-    "It's a Debian-based system using systemd, journald, and standard Linux utilities. Any prompt from the user should be solved using the available MCP tools."
+    "You are a helpful assistant. Answer the user's questions clearly and concisely. "
+    "You are interfacing to Debian Ollama tools that will let access to systemd, journald, "
+    "and standard Linux utilities. Any prompt from the user should be solved using the available tools."
 )
 
-# The CLI imports the server tools so we obey the same SSH execution path.
-TOOL_REGISTRY = {
-    "get_service_status": server.get_service_status,
-    "read_journal_logs": server.read_journal_logs,
-    "restart_service": server.restart_service,
-    "get_uptime": server.get_uptime,
-    "get_all_service": server.get_all_service,
-    "run_ssh_command": server.run_ssh_command,
-}
 
 TOOL_SPEC = [
     {
@@ -126,10 +112,45 @@ TOOL_SPEC = [
 ]
 
 
+def _run_ssh_cmd(cmd: str) -> str:
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect("127.0.0.1", port=2222, username="debian", password="debian")
+    try:
+        _stdin, stdout, _stderr = ssh.exec_command(cmd)
+        return stdout.read().decode()
+    finally:
+        ssh.close()
+
+
+def get_service_status(service_name: str) -> str:
+    return _run_ssh_cmd(f"systemctl status --no-pager {service_name}")
+
+
+def read_journal_logs(service_name: str | None = None, lines: int = 20) -> str:
+    if service_name:
+        return _run_ssh_cmd(f"journalctl -u {service_name} -n {lines} --no-pager")
+    return _run_ssh_cmd(f"journalctl -n {lines} --no-pager")
+
+
+def restart_service(service_name: str) -> str:
+    return _run_ssh_cmd(f"systemctl restart {service_name}")
+
+
+def get_uptime() -> str:
+    return _run_ssh_cmd("uptime -p")
+
+
+def get_all_service() -> str:
+    return _run_ssh_cmd("systemctl list-units --type=service --all --no-pager")
+
+
+def run_ssh_command(command: str) -> str:
+    return _run_ssh_cmd(command)
+
+
 def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Chat with the systemd MCP server through an Ollama-hosted qwen2.5-coder model."
-    )
+    parser = argparse.ArgumentParser(description="Chat with an Ollama model.")
     parser.add_argument(
         "prompt",
         nargs="?",
@@ -138,24 +159,13 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument(
         "-m",
         "--model",
-        default="qwen2.5-coder:latest",
-        help="Ollama model name to use (default: qwen2.5-coder:latest).",
-    )
-    parser.add_argument(
-        "--host",
-        default="",
-        help="Override Ollama host URL (otherwise uses environment defaults).",
+        default="qwen3",
+        help="Ollama model name to use (default: qwen3).",
     )
     parser.add_argument(
         "--system",
         default=DEFAULT_SYSTEM_PROMPT,
         help="Custom system prompt to steer the assistant.",
-    )
-    parser.add_argument(
-        "--max-tool-steps",
-        type=int,
-        default=20,
-        help="Maximum chained tool invocations allowed per user turn (default: 20).",
     )
     parser.add_argument(
         "--single",
@@ -165,152 +175,131 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     return parser.parse_args(list(argv))
 
 
-def _decode_arguments(raw_args: Any) -> Dict[str, Any]:
-    if isinstance(raw_args, str) and raw_args.strip():
-        return json.loads(raw_args)
-    if isinstance(raw_args, dict):
-        return raw_args
-    return {}
+def _chat_stream(
+    messages: List[Dict[str, Any]],
+    model: str,
+    tools: List[Any] | None,
+) -> Dict[str, Any]:
+    stream = chat(
+        model=model,
+        messages=messages,
+        tools=tools,
+        stream=True,
+        think=True,
+    )
 
+    thinking = ""
+    content = ""
+    tool_calls: List[Any] = []
+    done_thinking = False
 
-def _invoke_tool(call: Dict[str, Any]) -> str:
-    name = call.get("function", {}).get("name")
-    if name not in TOOL_REGISTRY:
-        return f"Unsupported tool requested: {name}"
-    arguments = _decode_arguments(call.get("function", {}).get("arguments"))
-    tool = TOOL_REGISTRY[name]
-    callable_tool = getattr(tool, "fn", None)
-    if callable_tool is None:
-        callable_tool = getattr(tool, "function", None)
-    if callable_tool is None:
-        callable_tool = tool
-    try:
-        result = callable_tool(**arguments)
-    except Exception as exc:  # noqa: BLE001 - we surface tool failures to the model
-        return f"Tool execution failed: {exc}"
-    if not isinstance(result, str):
-        result = str(result)
-    return result
+    for chunk in stream:
+        message = chunk.message
+        if message.thinking:
+            thinking += message.thinking
+            print(message.thinking, end="", flush=True)
+        if message.content:
+            if not done_thinking:
+                done_thinking = True
+                print("\n")
+            content += message.content
+            print(message.content, end="", flush=True)
+        if message.tool_calls:
+            tool_calls.extend(message.tool_calls)
+            print(message.tool_calls)
 
+    if thinking or content or tool_calls:
+        messages.append(
+            {
+                "role": "assistant",
+                "thinking": thinking,
+                "content": content,
+                "tool_calls": tool_calls,
+            }
+        )
 
-def _parse_fallback_tool_call(content: str) -> Optional[Dict[str, Any]]:
-    payload = content.strip()
-    if not payload:
-        return None
-    start = payload.find("{")
-    end = payload.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return None
-    snippet = payload[start:end + 1]
-    try:
-        data = json.loads(snippet)
-    except json.JSONDecodeError:
-        return None
-    name = data.get("name")
-    if not name:
-        return None
-    arguments = data.get("arguments", {})
     return {
-        "id": f"fallback-{uuid4().hex}",
-        "function": {
-            "name": name,
-            "arguments": arguments,
-        },
+        "role": "assistant",
+        "thinking": thinking,
+        "content": content,
+        "tool_calls": tool_calls,
     }
 
 
-def _chat_once(
-    client: Client,
+def _decode_arguments(raw_args: Any) -> Dict[str, Any]:
+    if isinstance(raw_args, dict):
+        return raw_args
+    if isinstance(raw_args, str) and raw_args.strip():
+        return json.loads(raw_args)
+    return {}
+
+
+def _extract_call_name_args(call: Any) -> tuple[str | None, Dict[str, Any]]:
+    if hasattr(call, "function"):
+        func = call.function
+        name = getattr(func, "name", None)
+        args = getattr(func, "arguments", {})
+        return name, _decode_arguments(args)
+    if isinstance(call, dict):
+        func = call.get("function", {})
+        name = func.get("name")
+        args = func.get("arguments", {})
+        return name, _decode_arguments(args)
+    return None, {}
+
+
+def _invoke_tool(call: Any, registry: Dict[str, Callable[..., str]]) -> str:
+    name, arguments = _extract_call_name_args(call)
+    if not name or name not in registry:
+        return f"Unknown tool: {name}"
+    try:
+        return registry[name](**arguments)
+    except Exception as exc:  # noqa: BLE001
+        return f"Tool execution failed: {exc}"
+
+
+def _run_turn(
     messages: List[Dict[str, Any]],
     model: str,
-    max_tool_steps: int,
-    tool_spec: List[Dict[str, Any]] | None,
-) -> Dict[str, Any]:
-    steps = 0
+    tools: List[Any] | None,
+    registry: Dict[str, Callable[..., str]],
+) -> None:
     while True:
-        response = client.chat(model=model, messages=messages, tools=tool_spec)
-        message = response.get("message", {})
-        messages.append(message)
-        tool_calls = message.get("tool_calls") or []
-        if tool_spec and not tool_calls:
-            fallback_call = _parse_fallback_tool_call(message.get("content", ""))
-            if fallback_call:
-                steps += 1
-                if steps > max_tool_steps:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": "Tool depth limit reached; unable to continue automatically.",
-                        }
-                    )
-                    return messages[-1]
-                tool_output = _invoke_tool(fallback_call)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": fallback_call["id"],
-                        "name": fallback_call["function"]["name"],
-                        "content": tool_output,
-                    }
-                )
-                continue
-        if not tool_spec or not tool_calls:
-            return message
+        reply = _chat_stream(messages, model, tools)
+        tool_calls = reply.get("tool_calls") or []
+        if not tool_calls:
+            if not reply.get("content"):
+                print()
+            break
         for call in tool_calls:
-            steps += 1
-            if steps > max_tool_steps:
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": "Tool depth limit reached; unable to continue automatically.",
-                    }
-                )
-                return messages[-1]
-            tool_output = _invoke_tool(call)
+            name, _ = _extract_call_name_args(call)
+            result = _invoke_tool(call, registry)
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": call.get("id"),
-                    "name": call.get("function", {}).get("name"),
-                    "content": tool_output,
+                    "tool_name": name or "unknown",
+                    "content": result,
                 }
             )
 
 
-def _print_assistant_reply(message: Dict[str, Any]) -> None:
-    content = message.get("content", "").strip()
-    if content:
-        print(f"assistant> {content}")
-
-
 def main(argv: Iterable[str] | None = None) -> None:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
-    client = Client(host=args.host) if args.host else Client()
-
     messages: List[Dict[str, Any]] = [{"role": "system", "content": args.system}]
     interactive = not args.single
-    tool_support = True
-
-    def chat_with_fallback() -> Dict[str, Any]:
-        nonlocal tool_support
-        try:
-            tool_spec = TOOL_SPEC if tool_support else None
-            return _chat_once(client, messages, args.model, args.max_tool_steps, tool_spec)
-        except ResponseError as exc:  # model might not support tool calls
-            message = str(exc).lower()
-            if tool_support and "does not support tools" in message:
-                print(
-                    "warning: model lacks tool support; falling back to plain chat.",
-                    file=sys.stderr,
-                )
-                tool_support = False
-                return _chat_once(client, messages, args.model, args.max_tool_steps, None)
-            raise
+    tools: List[Any] = TOOL_SPEC
+    registry: Dict[str, Callable[..., str]] = {
+        "get_service_status": get_service_status,
+        "read_journal_logs": read_journal_logs,
+        "restart_service": restart_service,
+        "get_uptime": get_uptime,
+        "get_all_service": get_all_service,
+        "run_ssh_command": run_ssh_command,
+    }
 
     if args.prompt:
         messages.append({"role": "user", "content": args.prompt})
-        reply = chat_with_fallback()
-        _print_assistant_reply(reply)
+        _run_turn(messages, args.model, tools, registry)
         if not interactive:
             return
 
@@ -329,8 +318,7 @@ def main(argv: Iterable[str] | None = None) -> None:
         if stripped.lower() in {"exit", "quit", "q"}:
             break
         messages.append({"role": "user", "content": stripped})
-        reply = chat_with_fallback()
-        _print_assistant_reply(reply)
+        _run_turn(messages, args.model, tools, registry)
 
 
 if __name__ == "__main__":
