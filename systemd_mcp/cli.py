@@ -50,7 +50,7 @@ TOOL_SPEC = [
                     },
                     "lines": {
                         "type": "integer",
-                        "description": "Number of log lines to return (default 50).",
+                        "description": "Number of log lines to return (default 100).",
                         "minimum": 1,
                         "maximum": 500,
                     },
@@ -88,7 +88,7 @@ TOOL_SPEC = [
         "type": "function",
         "function": {
             "name": "get_all_service",
-            "description": "List all systemd services on the target host.",
+            "description": "List all systemd services on the target host. A service can be active, inactive, or failed.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -127,7 +127,7 @@ def get_service_status(service_name: str) -> str:
     return _run_ssh_cmd(f"systemctl status --no-pager {service_name}")
 
 
-def read_journal_logs(service_name: str | None = None, lines: int = 50) -> str:
+def read_journal_logs(service_name: str | None = None, lines: int = 100) -> str:
     if service_name:
         return _run_ssh_cmd(f"journalctl -u {service_name} -n {lines} --no-pager")
     return _run_ssh_cmd(f"journalctl -n {lines} --no-pager")
