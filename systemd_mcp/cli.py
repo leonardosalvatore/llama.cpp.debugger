@@ -6,6 +6,14 @@ the same tool surface as the FastMCP server in ``systemd_mcp.server``.
 
 The thinking trace ships in the ``reasoning_content`` delta field thanks to
 ``--reasoning-format deepseek`` in ``start-llama-server.sh``.
+
+Two output modes, both driven through the ``Sink`` abstraction below:
+
+* default (stdout): the classic streaming print-to-terminal behavior.
+* ``--split-screen``: a full-screen ``prompt_toolkit`` TUI with
+  - top half:    chat with the model (reasoning, answer, tool calls).
+  - bottom half: every command sent over SSH to the SUT and its raw output.
+  - one-line input field at the very bottom.
 """
 
 from __future__ import annotations
@@ -13,8 +21,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import sys
-from typing import Any, Callable, Dict, Iterable, List
+import threading
+import time
+from abc import ABC, abstractmethod
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from openai import OpenAI
 
@@ -86,7 +98,6 @@ _BOOL = {"type": "boolean"}
 
 
 TOOL_SPEC: List[Dict[str, Any]] = [
-    # configuration_*
     _tool(
         "configuration_setTargetHost",
         "Point all subsequent tools at a different SSH target. Defaults match the QEMU SUT.",
@@ -102,7 +113,6 @@ TOOL_SPEC: List[Dict[str, Any]] = [
         "Return the currently configured SSH target (password redacted).",
     ),
 
-    # systemd_*
     _tool("systemd_get_service_status",
           "Run `systemctl status <service>` on the SUT.",
           {"service_name": _STR}, ["service_name"]),
@@ -123,7 +133,6 @@ TOOL_SPEC: List[Dict[str, Any]] = [
     _tool("systemd_get_uptime", "Return the SUT's uptime."),
     _tool("systemd_daemon_reload", "Reload systemd unit files (sudo)."),
 
-    # linux_*
     _tool("linux_list_directory", "List a directory (`ls -lh`).",
           {"path": _STR, "show_hidden": _BOOL}),
     _tool("linux_read_file", "Read up to `max_bytes` bytes from a file.",
@@ -159,7 +168,6 @@ TOOL_SPEC: List[Dict[str, Any]] = [
           "something 'in the background' so it survives the tool call - then attach gdb via gdb_start_session_attach(pid).",
           {"command": _STR, "cwd": _STR, "log_path": _STR}, ["command"]),
 
-    # compiler_*
     _tool("compiler_gcc",
           "Compile a single source file with gcc (C) or g++ (C++).",
           {
@@ -181,7 +189,6 @@ TOOL_SPEC: List[Dict[str, Any]] = [
     _tool("compiler_cmake_build", "Run `cmake --build build_dir`.",
           {"build_dir": _STR, "target": _STR, "jobs": _INT}, ["build_dir"]),
 
-    # gdb_*
     _tool("gdb_start_session_attach",
           "Attach gdb to a running process by PID inside a fresh tmux session.",
           {"pid": _INT}, ["pid"]),
@@ -205,26 +212,19 @@ TOOL_SPEC: List[Dict[str, Any]] = [
     _tool("gdb_continue",
           "Continue execution. Requires that gdb_run was called first; "
           "otherwise gdb returns 'The program is not being run'."),
-    _tool("gdb_step", "Step into."),
-    _tool("gdb_next", "Step over."),
-    _tool("gdb_finish", "Run until the current function returns."),
-    _tool("gdb_print", "Evaluate `print expr` in gdb.",
-          {"expr": _STR}, ["expr"]),
-    _tool("gdb_backtrace", "Print a backtrace of `depth` frames.",
-          {"depth": _INT}),
-    _tool("gdb_info_registers", "Dump CPU registers."),
-    _tool("gdb_info_threads", "List threads in the inferior."),
-    _tool("gdb_list_breakpoints", "List currently set breakpoints."),
-    _tool("gdb_quit", "Quit gdb and tear down the tmux session."),
+    _tool("gdb_step", "Step into (`step`)."),
+    _tool("gdb_next", "Step over (`next`)."),
+    _tool("gdb_finish", "Run until the current function returns (`finish`)."),
+    _tool("gdb_print", "Evaluate `print expr`.", {"expr": _STR}, ["expr"]),
+    _tool("gdb_backtrace", "Show a backtrace.", {"depth": _INT}),
+    _tool("gdb_info_registers", "Show CPU register state (`info registers`)."),
+    _tool("gdb_info_threads", "Show all threads (`info threads`)."),
+    _tool("gdb_list_breakpoints", "Show all current breakpoints (`info breakpoints`)."),
+    _tool("gdb_quit", "Quit the active gdb session and tear down the tmux pane."),
 ]
 
 
 def _unwrap(name: str) -> Callable[..., Any]:
-    """Return the plain Python callable for a server.py tool.
-
-    ``@mcp.tool()`` wraps each function in a FastMCP ``FunctionTool`` object
-    that is not directly callable; the original function lives on ``.fn``.
-    """
     obj = getattr(srv, name)
     return obj.fn if hasattr(obj, "fn") else obj
 
@@ -236,48 +236,231 @@ REGISTRY: Dict[str, Callable[..., Any]] = {
 
 
 # ---------------------------------------------------------------------------
-# CLI plumbing
+# Sink abstraction. The streaming/tool-dispatch loop is shared between modes
+# and only differs in WHERE chat tokens, SSH events, and the input prompt land.
 # ---------------------------------------------------------------------------
 
 
-def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Chat with the local llama.cpp server.")
-    parser.add_argument(
-        "prompt",
-        nargs="?",
-        help="Optional prompt to send immediately before entering interactive mode.",
-    )
-    parser.add_argument(
-        "-m", "--model",
-        default=os.environ.get("LLAMA_MODEL", "local"),
-        help="Model label to send to llama-server (server ignores this and uses the loaded GGUF).",
-    )
-    parser.add_argument(
-        "--llama-host",
-        default=os.environ.get("LLAMA_HOST", "127.0.0.1"),
-        help="llama-server host (default 127.0.0.1).",
-    )
-    parser.add_argument(
-        "--llama-port",
-        type=int,
-        default=int(os.environ.get("LLAMA_PORT", "53425")),
-        help="llama-server port (default 53425, matches start-llama-server.sh).",
-    )
-    parser.add_argument("--system", default=DEFAULT_SYSTEM_PROMPT,
-                        help="Custom system prompt.")
-    parser.add_argument("--single", action="store_true",
-                        help="Run a single exchange (non-interactive) and exit.")
-    parser.add_argument("--no-tools", action="store_true",
-                        help="Disable tool calling entirely (chat only).")
-    return parser.parse_args(list(argv))
+class Sink(ABC):
+    """A surface that receives chat tokens + SSH events and supplies user input."""
+
+    @abstractmethod
+    def banner(self, text: str) -> None: ...
+
+    @abstractmethod
+    def write_chat(self, text: str, kind: str = "answer") -> None: ...
+
+    @abstractmethod
+    def write_ssh(self, cmd: str, out: str) -> None: ...
+
+    @abstractmethod
+    def read_user(self, prompt: str) -> Optional[str]: ...
+
+    def close(self) -> None:
+        return None
 
 
-def _build_client(host: str, port: int) -> OpenAI:
-    return OpenAI(base_url=f"http://{host}:{port}/v1", api_key="not-needed")
+class StdoutSink(Sink):
+    """Classic streaming-print behavior. Matches the pre-TUI CLI byte-for-byte.
+
+    SSH wire events do NOT print here (the dispatch loop already shows
+    ``[tool result] ...``); they would be redundant noise.
+    """
+
+    def banner(self, text: str) -> None:
+        print(text, flush=True)
+
+    def write_chat(self, text: str, kind: str = "answer") -> None:
+        end = "\n" if kind in {"newline", "user_echo"} else ""
+        print(text, end=end, flush=True)
+
+    def write_ssh(self, cmd: str, out: str) -> None:
+        return None
+
+    def read_user(self, prompt: str) -> Optional[str]:
+        try:
+            return input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+
+# --- TUI sink ----------------------------------------------------------------
+
+
+def _ts() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+class TuiSink(Sink):
+    """Full-screen split-pane TUI driven by ``prompt_toolkit``.
+
+    Top frame: chat with the model (reasoning, answer, tool calls/results).
+    Bottom frame: SSH wire to the SUT - every command and its raw output.
+    Footer: one-line input field. Ctrl-C / Ctrl-Q exits.
+    """
+
+    _MAX_CHARS = 200_000  # ring-buffer cap per panel
+
+    def __init__(self) -> None:
+        from prompt_toolkit import Application
+        from prompt_toolkit.document import Document
+        from prompt_toolkit.key_binding import KeyBindings
+        from prompt_toolkit.layout import HSplit, Layout
+        from prompt_toolkit.styles import Style
+        from prompt_toolkit.widgets import Frame, TextArea
+
+        self._Document = Document
+
+        self._chat_lock = threading.Lock()
+        self._ssh_lock = threading.Lock()
+        self._chat_text = ""
+        self._ssh_text = ""
+        self._input_q: queue.Queue[Optional[str]] = queue.Queue()
+
+        self.chat_area = TextArea(
+            scrollbar=True,
+            read_only=True,
+            focusable=False,
+            wrap_lines=True,
+            style="class:chat",
+        )
+        self.ssh_area = TextArea(
+            scrollbar=True,
+            read_only=True,
+            focusable=False,
+            wrap_lines=True,
+            style="class:ssh",
+        )
+        self.input_area = TextArea(
+            height=1,
+            prompt="you> ",
+            multiline=False,
+            wrap_lines=False,
+            style="class:input",
+            accept_handler=self._on_accept,
+        )
+
+        kb = KeyBindings()
+
+        @kb.add("c-c")
+        @kb.add("c-q")
+        def _quit(event):  # noqa: ANN001
+            self._input_q.put(None)
+            event.app.exit()
+
+        style = Style.from_dict({
+            "frame.border": "#777777",
+            "frame.label": "bold #88c0d0",
+            "chat": "",
+            "ssh": "#a3be8c",
+            "input": "bold",
+        })
+
+        self.layout = Layout(
+            HSplit([
+                Frame(self.chat_area, title="chat (model)"),
+                Frame(self.ssh_area, title="ssh wire (SUT)"),
+                self.input_area,
+            ]),
+            focused_element=self.input_area,
+        )
+        self.app = Application(
+            layout=self.layout,
+            key_bindings=kb,
+            style=style,
+            full_screen=True,
+            mouse_support=True,
+        )
+
+    # -- prompt_toolkit callbacks -------------------------------------------
+
+    def _on_accept(self, buffer) -> bool:  # noqa: ANN001
+        text = buffer.text
+        # Echo the user's line into the chat panel so context is preserved.
+        self._append_chat(f"\nyou> {text}\n")
+        self._input_q.put(text)
+        return False
+
+    # -- internal append helpers --------------------------------------------
+
+    def _append_chat(self, text: str) -> None:
+        if not text:
+            return
+        with self._chat_lock:
+            self._chat_text += text
+            if len(self._chat_text) > self._MAX_CHARS:
+                self._chat_text = self._chat_text[-self._MAX_CHARS:]
+            payload = self._chat_text
+        self._set_area(self.chat_area, payload)
+
+    def _append_ssh(self, text: str) -> None:
+        if not text:
+            return
+        with self._ssh_lock:
+            self._ssh_text += text
+            if len(self._ssh_text) > self._MAX_CHARS:
+                self._ssh_text = self._ssh_text[-self._MAX_CHARS:]
+            payload = self._ssh_text
+        self._set_area(self.ssh_area, payload)
+
+    def _set_area(self, area: Any, text: str) -> None:
+        # Buffer mutation must happen on the UI thread; schedule via call_soon.
+        def _do() -> None:
+            area.buffer.set_document(
+                self._Document(text, cursor_position=len(text)),
+                bypass_readonly=True,
+            )
+
+        try:
+            loop = self.app.loop  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            loop = None
+        if loop is not None and self.app.is_running:
+            try:
+                loop.call_soon_threadsafe(_do)
+            except RuntimeError:
+                _do()
+        else:
+            _do()
+        if self.app.is_running:
+            self.app.invalidate()
+
+    # -- Sink interface -----------------------------------------------------
+
+    def banner(self, text: str) -> None:
+        self._append_chat(text + "\n")
+
+    def write_chat(self, text: str, kind: str = "answer") -> None:
+        if kind in {"newline", "user_echo"} and not text.endswith("\n"):
+            text = text + "\n"
+        self._append_chat(text)
+
+    def write_ssh(self, cmd: str, out: str) -> None:
+        line = f"\n[{_ts()}] $ {cmd}\n{out}"
+        if not line.endswith("\n"):
+            line += "\n"
+        self._append_ssh(line)
+
+    def read_user(self, prompt: str) -> Optional[str]:
+        # In TUI mode the prompt label is fixed ("you> "); callers may pass any
+        # value but we ignore it for layout consistency.
+        del prompt
+        try:
+            return self._input_q.get()
+        except KeyboardInterrupt:
+            return None
+
+    def close(self) -> None:
+        if self.app.is_running:
+            try:
+                self.app.exit()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # ---------------------------------------------------------------------------
-# Streaming helpers
+# Streaming helpers (shared by both sinks)
 # ---------------------------------------------------------------------------
 
 
@@ -286,6 +469,7 @@ def _stream_once(
     model: str,
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]] | None,
+    sink: Sink,
 ) -> Dict[str, Any]:
     """One streaming round-trip with llama-server. Returns the assistant message."""
     kwargs: Dict[str, Any] = {
@@ -314,16 +498,16 @@ def _stream_once(
         if reasoning:
             if not in_thinking_block:
                 in_thinking_block = True
-                print("\n[thinking]", flush=True)
+                sink.write_chat("\n[thinking]\n", kind="header")
             thinking += reasoning
-            print(reasoning, end="", flush=True)
+            sink.write_chat(reasoning, kind="thinking")
 
         if delta.content:
             if in_thinking_block and not in_content_block:
-                print("\n[answer]", flush=True)
+                sink.write_chat("\n[answer]\n", kind="header")
             in_content_block = True
             content += delta.content
-            print(delta.content, end="", flush=True)
+            sink.write_chat(delta.content, kind="answer")
 
         for tc in (delta.tool_calls or []):
             idx = tc.index if tc.index is not None else 0
@@ -337,7 +521,7 @@ def _stream_once(
                     slot["arguments"] += tc.function.arguments
 
     if in_thinking_block or in_content_block:
-        print()
+        sink.write_chat("\n", kind="newline")
 
     assembled_tool_calls = [
         {
@@ -390,19 +574,20 @@ def _run_turn(
     model: str,
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]] | None,
+    sink: Sink,
 ) -> None:
     while True:
-        msg = _stream_once(client, model, messages, tools)
+        msg = _stream_once(client, model, messages, tools, sink)
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
             return
         for call in tool_calls:
             name = call["function"]["name"]
             args = _decode_args(call["function"]["arguments"])
-            print(f"\n[tool] {name}({json.dumps(args)})", flush=True)
+            sink.write_chat(f"\n[tool] {name}({json.dumps(args)})\n", kind="tool_call")
             result = _invoke_tool(name, args)
-            print(f"[tool result] {result[:400]}{'...' if len(result) > 400 else ''}",
-                  flush=True)
+            preview = result[:400] + ("..." if len(result) > 400 else "")
+            sink.write_chat(f"[tool result] {preview}\n", kind="tool_result")
             messages.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
@@ -411,28 +596,78 @@ def _run_turn(
             })
 
 
-def main(argv: Iterable[str] | None = None) -> None:
-    args = _parse_args(sys.argv[1:] if argv is None else argv)
-    client = _build_client(args.llama_host, args.llama_port)
-    tools = None if args.no_tools else TOOL_SPEC
-    messages: List[Dict[str, Any]] = [{"role": "system", "content": args.system}]
+# ---------------------------------------------------------------------------
+# main / mode dispatch
+# ---------------------------------------------------------------------------
+
+
+def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Chat with the local llama.cpp server.")
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        help="Optional prompt to send immediately before entering interactive mode.",
+    )
+    parser.add_argument(
+        "-m", "--model",
+        default=os.environ.get("LLAMA_MODEL", "local"),
+        help="Model label to send to llama-server (server ignores this and uses the loaded GGUF).",
+    )
+    parser.add_argument(
+        "--llama-host",
+        default=os.environ.get("LLAMA_HOST", "127.0.0.1"),
+        help="llama-server host (default 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--llama-port",
+        type=int,
+        default=int(os.environ.get("LLAMA_PORT", "53425")),
+        help="llama-server port (default 53425, matches start-llama-server.sh).",
+    )
+    parser.add_argument("--system", default=DEFAULT_SYSTEM_PROMPT,
+                        help="Custom system prompt.")
+    parser.add_argument("--single", action="store_true",
+                        help="Run a single exchange (non-interactive) and exit.")
+    parser.add_argument("--no-tools", action="store_true",
+                        help="Disable tool calling entirely (chat only).")
+    parser.add_argument("--split-screen", "--tui", action="store_true",
+                        dest="split_screen",
+                        help="Render a full-screen TUI: top=chat, bottom=SSH wire to the SUT.")
+    return parser.parse_args(list(argv))
+
+
+def _build_client(host: str, port: int) -> OpenAI:
+    return OpenAI(base_url=f"http://{host}:{port}/v1", api_key="not-needed")
+
+
+def _banner_line(args: argparse.Namespace) -> str:
+    return (
+        f"llama.cpp.debugger -> http://{args.llama_host}:{args.llama_port}/v1 "
+        f"(target SUT: {srv._TARGET['username']}@{srv._TARGET['host']}:{srv._TARGET['port']})"
+    )
+
+
+def _model_loop(
+    args: argparse.Namespace,
+    client: OpenAI,
+    tools: List[Dict[str, Any]] | None,
+    messages: List[Dict[str, Any]],
+    sink: Sink,
+) -> None:
+    """Drive the chat. Identical for both stdout and TUI sinks."""
     interactive = not args.single
 
-    print(f"llama.cpp.debugger -> http://{args.llama_host}:{args.llama_port}/v1 "
-          f"(target SUT: {srv._TARGET['username']}@{srv._TARGET['host']}:{srv._TARGET['port']})",
-          flush=True)
-
     if args.prompt:
+        sink.write_chat(f"you> {args.prompt}\n", kind="user_echo")
         messages.append({"role": "user", "content": args.prompt})
-        _run_turn(client, args.model, messages, tools)
+        _run_turn(client, args.model, messages, tools, sink)
         if not interactive:
+            sink.close()
             return
 
     while True:
-        try:
-            user_input = input("\nyou> ")
-        except (EOFError, KeyboardInterrupt):
-            print()
+        user_input = sink.read_user("\nyou> ")
+        if user_input is None:
             break
         stripped = user_input.strip()
         if not stripped:
@@ -440,7 +675,37 @@ def main(argv: Iterable[str] | None = None) -> None:
         if stripped.lower() in {"exit", "quit", "q"}:
             break
         messages.append({"role": "user", "content": stripped})
-        _run_turn(client, args.model, messages, tools)
+        _run_turn(client, args.model, messages, tools, sink)
+    sink.close()
+
+
+def main(argv: Iterable[str] | None = None) -> None:
+    args = _parse_args(sys.argv[1:] if argv is None else argv)
+    client = _build_client(args.llama_host, args.llama_port)
+    tools = None if args.no_tools else TOOL_SPEC
+    messages: List[Dict[str, Any]] = [{"role": "system", "content": args.system}]
+
+    if args.split_screen:
+        sink = TuiSink()
+        srv.set_ssh_tap(sink.write_ssh)
+        sink.banner(_banner_line(args))
+        worker = threading.Thread(
+            target=_model_loop,
+            args=(args, client, tools, messages, sink),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            sink.app.run()
+        finally:
+            srv.set_ssh_tap(None)
+            # The worker may still be inside an OpenAI streaming call or an
+            # SSH command; we leave it as a daemon so the process exits.
+        return
+
+    sink = StdoutSink()
+    sink.banner(_banner_line(args))
+    _model_loop(args, client, tools, messages, sink)
 
 
 if __name__ == "__main__":

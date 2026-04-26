@@ -74,6 +74,21 @@ def _truncate(text: str) -> str:
 # foreground commands that legitimately take long should override per-call.
 _SSH_DEFAULT_TIMEOUT = 60.0
 
+# Optional observer that gets invoked with every (command, raw_output) pair
+# sent over SSH. Used by the split-screen TUI to mirror the SSH wire to a
+# dedicated panel. Stays None by default so non-TUI usage has zero overhead.
+_SSH_TAP: Any = None  # type: Callable[[str, str], None] | None
+
+
+def set_ssh_tap(tap: Any) -> None:
+    """Register a ``tap(cmd, output)`` callback fired on every SSH command.
+
+    Pass ``None`` to detach. The tap receives the *raw* (untruncated) output
+    so the TUI can paginate it independently of the model-facing truncation.
+    """
+    global _SSH_TAP
+    _SSH_TAP = tap
+
 
 def _run_ssh_cmd(cmd: str, timeout: float = _SSH_DEFAULT_TIMEOUT) -> str:
     """Run ``cmd`` on the configured target host over SSH and return stdout+stderr.
@@ -138,12 +153,25 @@ def _run_ssh_cmd(cmd: str, timeout: float = _SSH_DEFAULT_TIMEOUT) -> str:
         out = out_buf.decode(errors="replace")
         err = err_buf.decode(errors="replace")
         if err and not out:
-            return _truncate(err)
-        if err:
-            return _truncate(f"{out}\n[stderr]\n{err}")
-        return _truncate(out)
+            raw = err
+        elif err:
+            raw = f"{out}\n[stderr]\n{err}"
+        else:
+            raw = out
+        if _SSH_TAP is not None:
+            try:
+                _SSH_TAP(cmd, raw)
+            except Exception:  # noqa: BLE001
+                pass
+        return _truncate(raw)
     except (socket.timeout, paramiko.SSHException) as exc:
-        return f"[ssh error: {type(exc).__name__}: {exc}]"
+        msg = f"[ssh error: {type(exc).__name__}: {exc}]"
+        if _SSH_TAP is not None:
+            try:
+                _SSH_TAP(cmd, msg)
+            except Exception:  # noqa: BLE001
+                pass
+        return msg
     finally:
         ssh.close()
 

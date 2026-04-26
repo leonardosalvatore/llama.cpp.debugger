@@ -93,6 +93,15 @@ Open three terminals.
    Useful flags: `--llama-host`, `--llama-port` (defaults `127.0.0.1:53425`),
    `--single` (one-shot), `--no-tools` (chat only).
 
+   `--split-screen` (alias `--tui`) opens a full-screen TUI: top frame is the
+   chat with the model (reasoning, answer, tool calls), bottom frame mirrors
+   the live SSH wire to the SUT (every command + raw output, timestamped),
+   one-line input at the bottom. `Ctrl-C` / `Ctrl-Q` exits.
+
+   ```bash
+   poetry run llama_debugger_mcp_cli --split-screen
+   ```
+
 To stop QEMU:
 
 ```bash
