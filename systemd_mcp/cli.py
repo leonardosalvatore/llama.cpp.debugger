@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import queue
+import shlex
 import sys
 import threading
 import time
@@ -267,12 +268,20 @@ class StdoutSink(Sink):
     ``[tool result] ...``); they would be redundant noise.
     """
 
+    def __init__(self) -> None:
+        # Serializes prints from the model-loop thread and any background
+        # tail-worker threads spawned by --tail-bg-stdout. Without it, two
+        # writes can interleave mid-token on stdout.
+        self._write_lock = threading.Lock()
+
     def banner(self, text: str) -> None:
-        print(text, flush=True)
+        with self._write_lock:
+            print(text, flush=True)
 
     def write_chat(self, text: str, kind: str = "answer") -> None:
         end = "\n" if kind in {"newline", "user_echo"} else ""
-        print(text, end=end, flush=True)
+        with self._write_lock:
+            print(text, end=end, flush=True)
 
     def write_ssh(self, cmd: str, out: str) -> None:
         return None
@@ -597,6 +606,111 @@ def _run_turn(
 
 
 # ---------------------------------------------------------------------------
+# Background-stdout tail. When --tail-bg-stdout is set we register a tap with
+# the server so every linux_run_in_background launch gets its own SSH session
+# `tail --pid=PID -f LOG`, streamed line-by-line into the active sink.
+# ---------------------------------------------------------------------------
+
+
+def _tail_bg_log(
+    pid: int,
+    log_path: str,
+    target: Dict[str, Any],
+    sink: Sink,
+) -> None:
+    """Open a dedicated paramiko session and pump ``log_path`` into ``sink``.
+
+    Uses GNU ``tail --pid=PID -f`` so the SSH command exits cleanly when the
+    background process dies, releasing the connection without us polling.
+    """
+    import paramiko  # noqa: PLC0415  (import here so --no-tail callers stay light)
+
+    sink.write_chat(
+        f"\n[bg pid={pid}] streaming stdout from {log_path}\n",
+        kind="bg_header",
+    )
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(
+            target["host"],
+            port=int(target["port"]),
+            username=target["username"],
+            password=target["password"],
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=10.0,
+        )
+        transport = ssh.get_transport()
+        if transport is None:
+            sink.write_chat(
+                f"[bg pid={pid}] ssh transport unavailable\n",
+                kind="bg_stdout",
+            )
+            return
+        chan = transport.open_session()
+        chan.exec_command(
+            f"tail -n +1 --pid={int(pid)} -f {shlex.quote(log_path)}"
+        )
+
+        buf = bytearray()
+        while True:
+            got = False
+            if chan.recv_ready():
+                chunk = chan.recv(4096)
+                if chunk:
+                    buf.extend(chunk)
+                    got = True
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(buf[: nl + 1])
+                del buf[: nl + 1]
+                sink.write_chat(
+                    f"[bg pid={pid}] {line.decode(errors='replace')}",
+                    kind="bg_stdout",
+                )
+            if chan.exit_status_ready() and not chan.recv_ready():
+                if buf:
+                    sink.write_chat(
+                        f"[bg pid={pid}] {bytes(buf).decode(errors='replace')}\n",
+                        kind="bg_stdout",
+                    )
+                    buf.clear()
+                break
+            if not got:
+                time.sleep(0.1)
+        sink.write_chat(
+            f"[bg pid={pid}] --- stream ended (process exited) ---\n",
+            kind="bg_stdout",
+        )
+    except Exception as exc:  # noqa: BLE001
+        sink.write_chat(
+            f"[bg pid={pid}] stream error: {type(exc).__name__}: {exc}\n",
+            kind="bg_stdout",
+        )
+    finally:
+        try:
+            ssh.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _make_bg_streamer(sink: Sink) -> Callable[[int, str, Dict[str, Any]], None]:
+    """Build the ``set_bg_tap`` callback: spawn one daemon tail thread per launch."""
+    def _on_bg_launched(pid: int, log_path: str, target: Dict[str, Any]) -> None:
+        threading.Thread(
+            target=_tail_bg_log,
+            args=(pid, log_path, target, sink),
+            daemon=True,
+            name=f"bg-tail-{pid}",
+        ).start()
+
+    return _on_bg_launched
+
+
+# ---------------------------------------------------------------------------
 # main / mode dispatch
 # ---------------------------------------------------------------------------
 
@@ -633,6 +747,12 @@ def _parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--split-screen", "--tui", action="store_true",
                         dest="split_screen",
                         help="Render a full-screen TUI: top=chat, bottom=SSH wire to the SUT.")
+    parser.add_argument("--tail-bg-stdout", action="store_true",
+                        dest="tail_bg_stdout",
+                        help="Stream stdout/stderr of every program launched via "
+                             "linux_run_in_background. Each launch opens its own "
+                             "SSH session and `tail --pid=PID -f LOG` until the "
+                             "process exits.")
     return parser.parse_args(list(argv))
 
 
@@ -688,6 +808,8 @@ def main(argv: Iterable[str] | None = None) -> None:
     if args.split_screen:
         sink = TuiSink()
         srv.set_ssh_tap(sink.write_ssh)
+        if args.tail_bg_stdout:
+            srv.set_bg_tap(_make_bg_streamer(sink))
         sink.banner(_banner_line(args))
         worker = threading.Thread(
             target=_model_loop,
@@ -699,13 +821,20 @@ def main(argv: Iterable[str] | None = None) -> None:
             sink.app.run()
         finally:
             srv.set_ssh_tap(None)
+            srv.set_bg_tap(None)
             # The worker may still be inside an OpenAI streaming call or an
             # SSH command; we leave it as a daemon so the process exits.
         return
 
     sink = StdoutSink()
+    if args.tail_bg_stdout:
+        srv.set_bg_tap(_make_bg_streamer(sink))
     sink.banner(_banner_line(args))
-    _model_loop(args, client, tools, messages, sink)
+    try:
+        _model_loop(args, client, tools, messages, sink)
+    finally:
+        if args.tail_bg_stdout:
+            srv.set_bg_tap(None)
 
 
 if __name__ == "__main__":

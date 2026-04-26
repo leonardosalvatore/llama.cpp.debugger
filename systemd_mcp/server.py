@@ -79,6 +79,12 @@ _SSH_DEFAULT_TIMEOUT = 60.0
 # dedicated panel. Stays None by default so non-TUI usage has zero overhead.
 _SSH_TAP: Any = None  # type: Callable[[str, str], None] | None
 
+# Optional observer fired right after ``linux_run_in_background`` has spawned a
+# process on the SUT. Receives ``(pid, log_path, target_config)`` so a CLI can
+# open its own SSH session and tail the log until the process exits. Stays
+# None by default so non-streaming usage has zero overhead.
+_BG_TAP: Any = None  # type: Callable[[int, str, dict[str, Any]], None] | None
+
 
 def set_ssh_tap(tap: Any) -> None:
     """Register a ``tap(cmd, output)`` callback fired on every SSH command.
@@ -88,6 +94,18 @@ def set_ssh_tap(tap: Any) -> None:
     """
     global _SSH_TAP
     _SSH_TAP = tap
+
+
+def set_bg_tap(tap: Any) -> None:
+    """Register a ``tap(pid, log_path, target)`` callback fired on bg launches.
+
+    Invoked once per successful ``linux_run_in_background`` call, after the
+    PID is known. ``target`` is a shallow copy of the current SSH target
+    (host/port/username/password) so the consumer can open its own session.
+    Pass ``None`` to detach.
+    """
+    global _BG_TAP
+    _BG_TAP = tap
 
 
 def _run_ssh_cmd(cmd: str, timeout: float = _SSH_DEFAULT_TIMEOUT) -> str:
@@ -443,7 +461,23 @@ def linux_run_in_background(
         f"echo log={log_path}\n"
         f"exit 0\n"
     )
-    return _run_ssh_cmd(wrapped)
+    result = _run_ssh_cmd(wrapped)
+    if _BG_TAP is not None:
+        pid: int | None = None
+        for line in result.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("PID="):
+                try:
+                    pid = int(stripped[4:].strip())
+                except ValueError:
+                    pid = None
+                break
+        if pid is not None:
+            try:
+                _BG_TAP(pid, log_path, dict(_TARGET))
+            except Exception:  # noqa: BLE001
+                pass
+    return result
 
 
 # --- compiler_* ---------------------------------------------------------------

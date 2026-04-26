@@ -75,12 +75,8 @@ fqdn: debian-vm.local
 # \`dpkg --configure -a\` first to recover, and survive partial state.
 runcmd:
   - [ bash, -c, "DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 || true" ]
-  - [ bash, -c, "systemctl disable --now test.service 2>/dev/null || true" ]
-  - [ bash, -c, "rm -f /lib/systemd/system/test.service /etc/systemd/system/test.service /etc/systemd/system/multi-user.target.wants/test.service" ]
-  - [ bash, -c, "systemctl reset-failed test.service 2>/dev/null || true" ]
-  - systemctl daemon-reload
   - [ bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get update -y" ]
-  - [ bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux gdb gcc g++ make cmake" ]
+  - [ bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux gdb gcc g++ make cmake git" ]
   - [ bash, -c, "apt-get clean && rm -rf /var/lib/apt/lists/*" ]
 
 EOF
