@@ -4,6 +4,8 @@ A safe playground for driving an embedded Linux SUT (System Under Test) from a
 local LLM. The model runs on **llama.cpp** (`llama-server`) and acts on a Debian
 VM brought up by QEMU through an SSH-driven tool surface.
 
+Demo video: <https://www.youtube.com/watch?v=i8Lcic8HxLQ>
+
 It ships in two equivalent flavors:
 
 - **CLI** (`systemd_mcp/cli.py`) - talks to the local `llama-server` via its
