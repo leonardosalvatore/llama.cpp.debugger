@@ -34,6 +34,20 @@ _TARGET: dict[str, Any] = {
     "password": "debian",
 }
 
+# Env vars exported on every SSH command run by ``_run_ssh_cmd``. paramiko's
+# ``exec_command`` uses a non-interactive, non-login shell so ``~/.bashrc`` /
+# ``~/.profile`` are NOT sourced and most env vars set by sshd are stripped
+# (and ``SendEnv`` / ``AcceptEnv`` are off by default). We therefore prepend
+# explicit ``export K=V; ...`` to the command itself.
+#
+# DISPLAY=:0 lets GUI programs (lvglsim, glxgears, ...) reach whatever X
+# server / XWayland socket the desktop session opened on the SUT. If you
+# need an XAUTHORITY cookie or a different display, mutate this dict via
+# ``configuration_setRemoteEnv``.
+_REMOTE_ENV: dict[str, str] = {
+    "DISPLAY": ":0",
+}
+
 # Persistent tmux session name used by all gdb_* tools on the target host.
 _GDB_TMUX = "llamadbg"
 
@@ -108,6 +122,18 @@ def set_bg_tap(tap: Any) -> None:
     _BG_TAP = tap
 
 
+def _env_export_prefix() -> str:
+    """Return ``export K=V; ...`` for every entry in ``_REMOTE_ENV``.
+
+    Empty when the dict is empty, so we never inject a stray no-op statement.
+    Values are ``shlex.quote``-d so anything goes (spaces, ``$``, quotes, ...).
+    """
+    if not _REMOTE_ENV:
+        return ""
+    parts = [f"export {k}={shlex.quote(v)};" for k, v in _REMOTE_ENV.items()]
+    return " ".join(parts) + " "
+
+
 def _run_ssh_cmd(cmd: str, timeout: float = _SSH_DEFAULT_TIMEOUT) -> str:
     """Run ``cmd`` on the configured target host over SSH and return stdout+stderr.
 
@@ -115,6 +141,9 @@ def _run_ssh_cmd(cmd: str, timeout: float = _SSH_DEFAULT_TIMEOUT) -> str:
     sends EOF (typical bug: a backgrounded process inherits the SSH channel
     fd's), the channel is force-closed and any partial output returned with
     a trailing ``[ssh channel timed out ...]`` marker.
+
+    Every command is prefixed with the ``_REMOTE_ENV`` exports so GUI
+    binaries inherit ``DISPLAY`` / ``XAUTHORITY`` / etc.
     """
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -133,7 +162,7 @@ def _run_ssh_cmd(cmd: str, timeout: float = _SSH_DEFAULT_TIMEOUT) -> str:
             raise RuntimeError("ssh transport unavailable")
         chan = transport.open_session()
         chan.settimeout(timeout)
-        chan.exec_command(cmd)
+        chan.exec_command(_env_export_prefix() + cmd)
         out_buf = bytearray()
         err_buf = bytearray()
         deadline = time.monotonic() + timeout
@@ -229,6 +258,34 @@ def configuration_getTargetHost() -> dict[str, Any]:
         "username": _TARGET["username"],
         "password": "***" if _TARGET["password"] else "",
     }
+
+
+@mcp.tool()
+def configuration_setRemoteEnv(name: str, value: str) -> str:
+    """Set an env var that gets exported on every SSH command.
+
+    Use this to make GUI programs reach the SUT desktop, e.g.
+    ``DISPLAY=:0`` (default) or ``XAUTHORITY=/home/debian/.Xauthority``.
+    Pre-set: DISPLAY=:0.
+    """
+    _log("configuration_setRemoteEnv", name=name, value=value)
+    _REMOTE_ENV[name] = value
+    return f"Remote env updated: {name}={value}"
+
+
+@mcp.tool()
+def configuration_unsetRemoteEnv(name: str) -> str:
+    """Drop ``name`` from the always-exported remote env."""
+    _log("configuration_unsetRemoteEnv", name=name)
+    existed = _REMOTE_ENV.pop(name, None) is not None
+    return f"Remote env removed: {name}" if existed else f"Remote env had no {name}"
+
+
+@mcp.tool()
+def configuration_getRemoteEnv() -> dict[str, str]:
+    """Return the dict of env vars exported on every SSH command."""
+    _log("configuration_getRemoteEnv")
+    return dict(_REMOTE_ENV)
 
 
 # --- systemd_* ----------------------------------------------------------------

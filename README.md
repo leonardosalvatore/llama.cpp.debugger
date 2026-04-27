@@ -28,6 +28,46 @@ needs (`tmux`, `gdb`, `gcc`, `g++`, `make`, `cmake`). Image source:
 <https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2>.
 To use the Debian shell, press Enter and log in as `debian` / `debian`.
 
+By default the VM is headless (serial console attached to the launching
+terminal via `-nographic`). Set `GUI=1` to instead boot into a real
+graphical session in a QEMU window:
+
+```bash
+GUI=1 ./run_linux_in_qemu.sh                  # Xfce on Xorg via LightDM (default)
+GUI=1 DESKTOP=gnome ./run_linux_in_qemu.sh    # GNOME, Wayland session via gdm3
+GUI=1 GUI_ACCEL=1 ./run_linux_in_qemu.sh      # opt in to virgl GL acceleration
+```
+
+When `GUI=1`:
+
+- Cloud-init **first enables a text getty on tty1**, then installs the chosen
+  desktop in the background. So a few seconds after boot the QEMU window
+  shows a `debian-vm login:` prompt - log in as `debian` / `debian` and run
+  `journalctl -fu cloud-final` to watch the desktop install live (don't
+  panic if the screen stays blank past the kernel boot, that's just tty1
+  before getty has spawned).
+- The desktop install pulls ~400-800 MB and takes 5-15 minutes on the first
+  boot; subsequent boots go straight to the graphical login.
+- RAM is bumped to 4096 MB (override with `QEMU_RAM_MB=...`) and KVM
+  (`-enable-kvm -cpu host`) is auto-enabled when `/dev/kvm` is accessible.
+  Without KVM the desktop is unusable.
+- The boot resolution defaults to **1024x768**; override with e.g.
+  `QEMU_RES=1920x1080`. This sets the virtio-vga `xres` / `yres` properties,
+  which controls GRUB / early kernel / login-screen geometry. After login,
+  `spice-vdagent` auto-resizes the desktop to match the QEMU window.
+- The default GPU setup is `-device virtio-vga -display gtk` (software
+  rendered, but rock-solid, no virgl needed). Set `GUI_ACCEL=1` to switch
+  to `-device virtio-vga-gl -display gtk,gl=on` for virgl host-OpenGL
+  passthrough - faster, but on some QEMU versions emits `Blocked re-entrant
+  IO on vga-lowmem` and ends in a black QEMU window. If that happens to
+  you, drop `GUI_ACCEL`.
+- `spice-vdagent` + `usb-tablet` are wired in either way for absolute mouse
+  / clipboard / resolution integration.
+
+Switching desktops on an already-provisioned disk requires `RESET=1` (the
+desktop install lives in cloud-init `runcmd`, which only runs on a fresh
+instance), or just `apt install task-gnome-desktop` from inside the VM.
+
 **`systemd_mcp/server.py`** - FastMCP server. All tools route through one
 `_run_ssh_cmd` helper that reads its target from a single module-level dict;
 the agent can repoint it at runtime via `configuration_setTargetHost`.
@@ -40,7 +80,7 @@ re-using the same callables registered in `server.py`. Streams the
 
 | Prefix              | Purpose                                                        |
 |---------------------|----------------------------------------------------------------|
-| `configuration_*`   | `setTargetHost(host, port, username, password)`, `getTargetHost` |
+| `configuration_*`   | `setTargetHost(host, port, username, password)`, `getTargetHost`, `setRemoteEnv(name, value)`, `unsetRemoteEnv(name)`, `getRemoteEnv` |
 | `systemd_*`         | service status, journal, start/stop/restart/enable/disable, daemon-reload, list, uptime |
 | `linux_*`           | list/read/write/append/remove files, mkdir, cp, mv, find, grep, ps, df, which |
 | `compiler_*`        | `gcc`, `make`, `cmake_configure`, `cmake_build`                |
@@ -74,7 +114,11 @@ Open three terminals.
 
    ```bash
    RESET=1 ./run_linux_in_qemu.sh
-   QEMU_DISK_SIZE=32G ./run_linux_in_qemu.sh   # override default disk size
+   QEMU_DISK_SIZE=32G ./run_linux_in_qemu.sh    # override default disk size
+   GUI=1 ./run_linux_in_qemu.sh                 # boot into Xfce in a QEMU window
+   GUI=1 DESKTOP=gnome ./run_linux_in_qemu.sh   # boot into GNOME (Wayland)
+   GUI=1 GUI_ACCEL=1 ./run_linux_in_qemu.sh     # add virgl GPU acceleration
+   GUI=1 QEMU_RES=1920x1080 ./run_linux_in_qemu.sh  # custom boot resolution
    ```
 
 3. **Run the agent**
@@ -118,11 +162,40 @@ real board (or a second VM):
   `configuration_setTargetHost`.
 - Or call the tool directly from any MCP client.
 
+## Running GUI programs on the SUT
+
+paramiko's `exec_command` runs a non-interactive, non-login shell, so
+`~/.bashrc` / `~/.profile` are skipped and `sshd` strips most env vars
+(`SendEnv` / `AcceptEnv` are off). To make GUI programs (lvglsim, glxgears,
+GTK apps, ...) reach the desktop session running inside the SUT, the server
+unconditionally prepends a set of `export K=V; ...` to every command run
+through `_run_ssh_cmd`. The defaults are:
+
+```
+DISPLAY=:0
+```
+
+That covers Xfce / LightDM (real Xorg on `:0`) and GNOME / GDM (XWayland
+also exposes `:0`). If you need an X cookie or a different display, mutate
+the dict at runtime:
+
+- *"Set the remote env XAUTHORITY to /home/debian/.Xauthority"* -> the
+  model calls `configuration_setRemoteEnv`.
+- `configuration_unsetRemoteEnv("DISPLAY")` strips a key.
+- `configuration_getRemoteEnv()` shows what's currently exported.
+
+The exports apply to **every** SSH-driven tool, including
+`linux_run_in_background` (so a backgrounded `lvglsim` inherits `DISPLAY`)
+and the persistent gdb tmux session.
+
 ## Requirements
 
 **Host:** `poetry`, `genisoimage` (or `cloud-localds` / `mkisofs`),
 `qemu-system-x86_64`, the ROCm-built `llama-server` referenced by
-`start-llama-server.sh`.
+`start-llama-server.sh`. For `GUI=1` mode also: KVM access (your user in
+the `kvm` group, or `/dev/kvm` otherwise readable+writable). For
+`GUI_ACCEL=1` additionally: `libvirglrenderer1` for virgl host-OpenGL
+passthrough.
 
 **SUT:** `tmux` and `gdb` are required for `gdb_*` tools; `gcc`, `g++`, `make`
 and `cmake` for `compiler_*`. On Debian/Ubuntu:
