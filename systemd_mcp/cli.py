@@ -43,6 +43,21 @@ DEFAULT_SYSTEM_PROMPT = (
     "  compiler_*      gcc / g++ / make / cmake builds\n"
     "  gdb_*           debugger control via a persistent tmux session\n"
     "  configuration_* point the agent at a different SSH target\n"
+    "  rag_*           dense retrieval over the LVGL vector DB. The corpus "
+    "contains BOTH the official docs (docs/src/*.md, *.mdx) AND the actual "
+    "source code (src/*.c, src/*.h, examples/*.c) of the lvgl/lvgl repo. "
+    "REQUIRED: for any task that involves LVGL, lv_* APIs, widgets, layouts, "
+    "animations, styles, events, themes, or any C-level question about LVGL "
+    "internals, you MUST call rag_search at least once before answering. "
+    "For multi-API tasks (e.g. button + animation + event) call rag_search "
+    "SEPARATELY for each distinct concept rather than packing them into a "
+    "single broad query - 5 focused queries beat 1 broad one because each "
+    "returns chunks tightly aligned with that one API. ALWAYS cite the paths "
+    "(docs/src/... or src/...) of the chunks you used in your answer. The "
+    "tool soft-fails (returns hits=[] with an error) if the embedding server "
+    "or DB are missing - in that case continue without retrieval and tell "
+    "the user to run ./start-llama-embedding-server.sh and/or "
+    "`poetry run llama_debugger_vectordb build`.\n"
     "Default target is debian@127.0.0.1:2222 (the QEMU box from "
     "run_linux_in_qemu.sh); call configuration_setTargetHost to switch.\n"
     "\n"
@@ -67,6 +82,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "* If a tool reports 'No space left on device', call linux_disk_usage and "
     "report - do NOT delete /var/log, /var/cache, /usr, or anything outside "
     "/tmp and the user's working directory.\n"
+    "* Privilege: `linux_write_file`, `linux_append_file`, `linux_remove`, "
+    "`linux_make_directory`, `linux_copy`, `linux_move`, "
+    "`gdb_start_session_run` and `gdb_start_session_core` default to "
+    "sudo=false. Pass sudo=true ONLY when the path is in a root-owned tree "
+    "(/etc, /usr, /var, /opt, ...) or when a 'permission denied' error makes "
+    "it necessary. `gdb_start_session_attach` defaults to sudo=true (ptrace "
+    "across UIDs needs it); set sudo=false when the PID is owned by the "
+    "debian login user. systemd_* and systemd_daemon_reload always run via "
+    "sudo internally - no flag needed.\n"
     "Always answer concisely and prefer running tools over guessing."
 )
 
@@ -138,18 +162,54 @@ TOOL_SPEC: List[Dict[str, Any]] = [
           {"path": _STR, "show_hidden": _BOOL}),
     _tool("linux_read_file", "Read up to `max_bytes` bytes from a file.",
           {"path": _STR, "max_bytes": _INT}, ["path"]),
-    _tool("linux_write_file", "Overwrite a file with the given content (sudo).",
-          {"path": _STR, "content": _STR}, ["path", "content"]),
-    _tool("linux_append_file", "Append content to a file (sudo).",
-          {"path": _STR, "content": _STR}, ["path", "content"]),
-    _tool("linux_remove", "Remove a file or (recursively) a directory (sudo).",
-          {"path": _STR, "recursive": _BOOL}, ["path"]),
-    _tool("linux_make_directory", "Create a directory (sudo, `-p` by default).",
-          {"path": _STR, "parents": _BOOL}, ["path"]),
-    _tool("linux_copy", "Copy a file or directory (sudo).",
-          {"src": _STR, "dst": _STR, "recursive": _BOOL}, ["src", "dst"]),
-    _tool("linux_move", "Move/rename a file or directory (sudo).",
-          {"src": _STR, "dst": _STR}, ["src", "dst"]),
+    # File-mutation tools all default to sudo=False (run unprivileged).
+    # Set sudo=True only when the path is in a root-owned tree such as
+    # /etc/, /usr/, /var/, /opt/, or a service's working directory the
+    # debian login user does not own. The 95% case (work in /home/debian,
+    # /tmp, build trees) needs no escalation.
+    _tool("linux_write_file",
+          "Overwrite a file with the given content. Default sudo=false; set "
+          "sudo=true only for root-owned paths (/etc, /usr, /var, /opt, ...).",
+          {"path": _STR, "content": _STR,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo tee` (default false). Required for "
+                    "root-owned paths."}},
+          ["path", "content"]),
+    _tool("linux_append_file",
+          "Append content to a file. Default sudo=false; set sudo=true only "
+          "for root-owned paths.",
+          {"path": _STR, "content": _STR,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo tee -a` (default false)."}},
+          ["path", "content"]),
+    _tool("linux_remove",
+          "Remove a file or (recursively) a directory. Default sudo=false; "
+          "set sudo=true only for root-owned targets.",
+          {"path": _STR, "recursive": _BOOL,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo rm` (default false)."}},
+          ["path"]),
+    _tool("linux_make_directory",
+          "Create a directory (`-p` by default). Default sudo=false; set "
+          "sudo=true only for root-owned trees.",
+          {"path": _STR, "parents": _BOOL,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo mkdir` (default false)."}},
+          ["path"]),
+    _tool("linux_copy",
+          "Copy a file or directory. Default sudo=false; set sudo=true if "
+          "either endpoint is root-owned.",
+          {"src": _STR, "dst": _STR, "recursive": _BOOL,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo cp` (default false)."}},
+          ["src", "dst"]),
+    _tool("linux_move",
+          "Move/rename a file or directory. Default sudo=false; set "
+          "sudo=true if either endpoint is root-owned.",
+          {"src": _STR, "dst": _STR,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo mv` (default false)."}},
+          ["src", "dst"]),
     _tool("linux_find", "Find files by name pattern under a path.",
           {"path": _STR, "name_pattern": _STR}, ["path"]),
     _tool("linux_grep", "Grep for a pattern under a path (recursive by default).",
@@ -191,15 +251,32 @@ TOOL_SPEC: List[Dict[str, Any]] = [
           {"build_dir": _STR, "target": _STR, "jobs": _INT}, ["build_dir"]),
 
     _tool("gdb_start_session_attach",
-          "Attach gdb to a running process by PID inside a fresh tmux session.",
-          {"pid": _INT}, ["pid"]),
+          "Attach gdb to a running process by PID inside a fresh tmux session. "
+          "sudo defaults to TRUE because attaching across UIDs (e.g. a systemd "
+          "service running as root) needs ptrace privileges; set sudo=false "
+          "only when the PID is owned by the SUT login user.",
+          {"pid": _INT,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo gdb -p` (default true). Set false for "
+                    "self-owned PIDs."}},
+          ["pid"]),
     _tool("gdb_start_session_run",
           "Open a binary under gdb (LOADED but NOT EXECUTING). "
-          "Required workflow: gdb_start_session_run -> gdb_break (optional) -> gdb_run -> gdb_continue/step/print.",
-          {"binary": _STR, "args": _STR}, ["binary"]),
+          "Required workflow: gdb_start_session_run -> gdb_break (optional) -> "
+          "gdb_run -> gdb_continue/step/print. sudo defaults to FALSE; set "
+          "sudo=true only if the binary needs root to run.",
+          {"binary": _STR, "args": _STR,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo gdb` (default false)."}},
+          ["binary"]),
     _tool("gdb_start_session_core",
-          "Open a core dump for a binary in a fresh tmux gdb session.",
-          {"binary": _STR, "core": _STR}, ["binary", "core"]),
+          "Open a core dump for a binary in a fresh tmux gdb session. sudo "
+          "defaults to FALSE; set sudo=true only when the binary or core file "
+          "lives in a root-owned tree the SUT user can't read.",
+          {"binary": _STR, "core": _STR,
+           "sudo": {**_BOOL, "description":
+                    "Run via `sudo gdb` (default false)."}},
+          ["binary", "core"]),
     _tool("gdb_send_command",
           "Send an arbitrary command to the running gdb session and return the pane.",
           {"command": _STR}, ["command"]),
@@ -222,6 +299,22 @@ TOOL_SPEC: List[Dict[str, Any]] = [
     _tool("gdb_info_threads", "Show all threads (`info threads`)."),
     _tool("gdb_list_breakpoints", "Show all current breakpoints (`info breakpoints`)."),
     _tool("gdb_quit", "Quit the active gdb session and tear down the tmux pane."),
+
+    _tool("rag_search",
+          "Search the LVGL vector DB (docs + src/*.c + src/*.h + examples/*.c) "
+          "and return the top-k matching chunks (path, heading=enclosing "
+          "function for code chunks, title, snippet, similarity score). MUST "
+          "be called for every distinct LVGL concept involved in the task: "
+          "for 'button + click + fade' run THREE separate searches "
+          "('lv_button_create', 'lv_obj_add_event_cb click handler', "
+          "'lv_anim opacity fade exec_cb'). One broad query gives diluted "
+          "results; 5 focused queries surface 5 tightly-aligned chunks. Cite "
+          "the returned paths (docs/src/..., src/..., examples/...) in your "
+          "answer. Soft-fails with hits=[] + error string if the embedding "
+          "server (port 53426) or DB is missing.",
+          {"query": _STR,
+           "k": {**_INT, "minimum": 1, "maximum": 20}},
+          ["query"]),
 ]
 
 

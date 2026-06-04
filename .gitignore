@@ -1,3 +1,23 @@
 __pycache__/*
+**/__pycache__/
 os_images/*
 systemd_mcp/__pycache__/*
+systemd_mcp/vectordb/__pycache__/*
+# The vectordb store now lives next to the package so it's discoverable
+# from the agent without needing a path env var, but it's ~50-100 MB of
+# embeddings and must stay out of git.
+systemd_mcp/vectordb/vector-database.db
+systemd_mcp/vectordb/vector-database.db-journal
+systemd_mcp/vectordb/vector-database.db-wal
+systemd_mcp/vectordb/vector-database.db-shm
+# LVGL clone + any leftover pre-move DBs from earlier builds.
+.cache/
+# Vector stores can hold SUT hostnames, usernames, ports, and raw log
+# lines (which may include IPs). Never commit any .db (or its sqlite
+# sidecar files), wherever it lives in the tree.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+# Debug-mode instrumentation logs.
+.cursor/debug-*.log

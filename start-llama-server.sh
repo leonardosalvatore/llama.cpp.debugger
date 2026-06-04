@@ -2,15 +2,22 @@
 # Start llama-server with the bundled ROCm binary and GGUF model.
 #
 # Usage:
-#   ./start-llama-server.sh [-p PORT] [-c CTX] [model.gguf]
+#   ./start-llama-server.sh [-p PORT] [-c CTX] [-g GPU] [model.gguf]
 #
 # Flags / env:
 #   -p, --port      <int>   server port (env: LLAMA_PORT, default 53425)
 #   -c, --ctx-size  <int>   context window in tokens (env: LLAMA_CTX, default 32768)
+#   -g, --gpu       <id>    HIP device index to use (env: LLAMA_GPU, default 0).
+#                           Pinned via HIP_VISIBLE_DEVICES. Pass a single
+#                           index ("0") or a comma list ("0,1"). On a dual-GPU
+#                           rig, default 0 keeps the chat model on the big
+#                           discrete GPU; the embedding server defaults to 1
+#                           (the iGPU) so they don't fight over VRAM.
 #
 # Examples:
 #   ./start-llama-server.sh
 #   ./start-llama-server.sh -p 53425 -c 65536
+#   ./start-llama-server.sh -g 0                  # pin to the discrete card
 #   LLAMA_CTX=65536 ./start-llama-server.sh
 #   ./start-llama-server.sh /path/to/model.gguf -p 53425
 
@@ -25,6 +32,7 @@ DEFAULT_MODEL="${LLAMA_DIR}/Ministral-3-8B-Reasoning-2512-Q5_K_M.gguf"
 PORT=""
 MODEL=""
 CTX=""
+GPU=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -36,8 +44,12 @@ while [ $# -gt 0 ]; do
             CTX="$2"
             shift 2
             ;;
+        -g|--gpu)
+            GPU="$2"
+            shift 2
+            ;;
         -h|--help)
-            sed -n '2,14p' "$0"
+            sed -n '2,22p' "$0"
             exit 0
             ;;
         *)
@@ -50,6 +62,7 @@ done
 # Allow env vars as fallback; finally fall back to baked-in defaults.
 PORT="${PORT:-${LLAMA_PORT:-53425}}"
 CTX="${CTX:-${LLAMA_CTX:-32768}}"
+GPU="${GPU:-${LLAMA_GPU:-0}}"
 MODEL="${MODEL:-$DEFAULT_MODEL}"
 
 if [ -z "$MODEL" ]; then
@@ -69,6 +82,17 @@ ln -s /opt/rocm/lib/libamdhip64.so.6 ./libamdhip64.so.7 2>/dev/null
 ln -s /opt/rocm/lib/libhipblas.so.2 ./libhipblas.so.3 2>/dev/null
 ln -s /opt/rocm/lib/librocblas.so.4 ./librocblas.so.5 2>/dev/null
 
+# rocBLAS Tensile kernels: rocBLAS looks up ./rocblas/library/TensileLibrary*.dat
+# relative to cwd. Since we cd into LLAMA_DIR (no rocblas/ subdir), GEMMs that
+# go through Tensile abort with "Cannot read ./rocblas/library/TensileLibrary.dat"
+# / "No such file or directory [./rocblas/library]". Point rocBLAS at the
+# system path explicitly and symlink as a fallback for older rocBLAS that
+# doesn't honor the env var. The embedding launcher needs this immediately;
+# the chat launcher only hits it on certain ops, but it's safer to ship the
+# fix here too.
+export ROCBLAS_TENSILE_LIBPATH=/opt/rocm/lib/rocblas/library
+ln -s /opt/rocm/lib/rocblas ./rocblas 2>/dev/null
+
 export LD_LIBRARY_PATH=.:/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH
 
 echo "Starting llama-server..."
@@ -76,6 +100,7 @@ echo "  Binary : ${LLAMA_DIR}/llama-server"
 echo "  Model  : ${MODEL}"
 echo "  Port   : ${PORT}"
 echo "  Ctx    : ${CTX} tokens"
+echo "  GPU    : HIP_VISIBLE_DEVICES=${GPU}"
 echo ""
 
 # --jinja            : use the GGUF's embedded Jinja chat template. REQUIRED for
@@ -99,7 +124,7 @@ echo ""
 # the bots launcher's g_child_pid points at /bin/bash, and on SIGTERM bash
 # dies while llama-server gets reparented to init and keeps running. Sharing
 # a single pid makes the launcher's kill() reach the actual server.
-exec env HIP_VISIBLE_DEVICES=0 HSA_OVERRIDE_GFX_VERSION=10.3.0 \
+exec env HIP_VISIBLE_DEVICES="$GPU" HSA_OVERRIDE_GFX_VERSION=10.3.0 \
     ./llama-server \
     --model "$MODEL" \
     --host 0.0.0.0 \

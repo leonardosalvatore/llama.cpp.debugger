@@ -1,18 +1,23 @@
 """FastMCP server for llama.cpp.debugger.
 
-Exposes four tool namespaces, all driven over SSH by ``_run_ssh_cmd`` against
+Exposes five tool namespaces, all driven over SSH by ``_run_ssh_cmd`` against
 a configurable target host (defaults to the QEMU SUT brought up by
-``run_linux_in_qemu.sh``):
+``run_linux_in_qemu.sh``), plus one local-only retrieval namespace:
 
 * ``systemd_*``    - systemd / journald management
 * ``linux_*``      - generic filesystem and process inspection
 * ``compiler_*``   - gcc / g++ / make / cmake invocations
 * ``gdb_*``        - debugger control via a persistent ``tmux`` session
 * ``configuration_*`` - point the agent at a different target host
+* ``rag_*``        - dense retrieval (``rag_search``) over the LVGL docs
+                     vector DB built by ``llama_debugger_vectordb`` (uses the
+                     embedding llama-server on port 53426; soft-fails when
+                     either the server or the DB is missing).
 """
 
 from __future__ import annotations
 
+import os
 import shlex
 import socket
 import sys
@@ -383,12 +388,32 @@ def linux_read_file(path: str, max_bytes: int = 65536) -> str:
     return _run_ssh_cmd(f"head -c {int(max_bytes)} {shlex.quote(path)}")
 
 
+# --- File-mutation helpers ---------------------------------------------------
+#
+# All linux_* tools that *write* on the SUT take an explicit ``sudo`` flag,
+# defaulting to ``False`` so the common case (mkdir/rm/cp/mv/write under
+# /home/debian, /tmp, build dirs) doesn't escalate. Set ``sudo=True`` only
+# when the path is system-owned (/etc/, /usr/, /var/, /opt/, ...). Same
+# rationale as ``compiler_*`` running unprivileged.
+
+
+def _maybe_sudo(sudo: bool) -> str:
+    """Return ``"sudo "`` when escalation is requested, else empty string."""
+    return "sudo " if sudo else ""
+
+
 @mcp.tool()
-def linux_write_file(path: str, content: str) -> str:
-    """Overwrite ``path`` with ``content`` (uses sudo so system files work too)."""
-    _log("linux_write_file", path=path, bytes=len(content))
+def linux_write_file(path: str, content: str, sudo: bool = False) -> str:
+    """Overwrite ``path`` with ``content``.
+
+    Defaults to running unprivileged. Set ``sudo=True`` for paths the
+    invoking user (``debian``) cannot write directly - typically
+    ``/etc/``, ``/usr/``, ``/var/``, ``/opt/`` and any other root-owned
+    tree.
+    """
+    _log("linux_write_file", path=path, bytes=len(content), sudo=sudo)
     cmd = (
-        f"sudo tee {shlex.quote(path)} > /dev/null << 'LLAMA_DBG_EOF'\n"
+        f"{_maybe_sudo(sudo)}tee {shlex.quote(path)} > /dev/null << 'LLAMA_DBG_EOF'\n"
         f"{content}\n"
         f"LLAMA_DBG_EOF\n"
         f"echo wrote $(wc -c < {shlex.quote(path)}) bytes to {shlex.quote(path)}"
@@ -397,11 +422,14 @@ def linux_write_file(path: str, content: str) -> str:
 
 
 @mcp.tool()
-def linux_append_file(path: str, content: str) -> str:
-    """Append ``content`` to ``path`` (uses sudo)."""
-    _log("linux_append_file", path=path, bytes=len(content))
+def linux_append_file(path: str, content: str, sudo: bool = False) -> str:
+    """Append ``content`` to ``path``.
+
+    Defaults to running unprivileged; pass ``sudo=True`` for system paths.
+    """
+    _log("linux_append_file", path=path, bytes=len(content), sudo=sudo)
     cmd = (
-        f"sudo tee -a {shlex.quote(path)} > /dev/null << 'LLAMA_DBG_EOF'\n"
+        f"{_maybe_sudo(sudo)}tee -a {shlex.quote(path)} > /dev/null << 'LLAMA_DBG_EOF'\n"
         f"{content}\n"
         f"LLAMA_DBG_EOF\n"
         f"echo appended to {shlex.quote(path)}"
@@ -410,36 +438,65 @@ def linux_append_file(path: str, content: str) -> str:
 
 
 @mcp.tool()
-def linux_remove(path: str, recursive: bool = False) -> str:
-    """Remove a file or (recursively) a directory (uses sudo)."""
-    _log("linux_remove", path=path, recursive=recursive)
+def linux_remove(path: str, recursive: bool = False, sudo: bool = False) -> str:
+    """Remove a file or (recursively) a directory.
+
+    Defaults to running unprivileged; pass ``sudo=True`` for root-owned
+    targets.
+    """
+    _log("linux_remove", path=path, recursive=recursive, sudo=sudo)
     flags = "-rf" if recursive else "-f"
-    return _run_ssh_cmd(f"sudo rm {flags} {shlex.quote(path)} 2>&1 && echo OK")
-
-
-@mcp.tool()
-def linux_make_directory(path: str, parents: bool = True) -> str:
-    """Create a directory (uses sudo, ``-p`` by default)."""
-    _log("linux_make_directory", path=path, parents=parents)
-    flags = "-p" if parents else ""
-    return _run_ssh_cmd(f"sudo mkdir {flags} {shlex.quote(path)} 2>&1 && echo OK")
-
-
-@mcp.tool()
-def linux_copy(src: str, dst: str, recursive: bool = False) -> str:
-    """Copy ``src`` to ``dst`` (uses sudo)."""
-    _log("linux_copy", src=src, dst=dst, recursive=recursive)
-    flags = "-r" if recursive else ""
     return _run_ssh_cmd(
-        f"sudo cp {flags} {shlex.quote(src)} {shlex.quote(dst)} 2>&1 && echo OK"
+        f"{_maybe_sudo(sudo)}rm {flags} {shlex.quote(path)} 2>&1 && echo OK"
     )
 
 
 @mcp.tool()
-def linux_move(src: str, dst: str) -> str:
-    """Move/rename ``src`` to ``dst`` (uses sudo)."""
-    _log("linux_move", src=src, dst=dst)
-    return _run_ssh_cmd(f"sudo mv {shlex.quote(src)} {shlex.quote(dst)} 2>&1 && echo OK")
+def linux_make_directory(
+    path: str, parents: bool = True, sudo: bool = False
+) -> str:
+    """Create a directory (``-p`` by default).
+
+    Defaults to running unprivileged - the common case is ``mkdir`` under
+    ``/home/debian``, ``/tmp``, or a build tree the SUT user owns. Pass
+    ``sudo=True`` only for root-owned trees like ``/etc/`` or ``/var/``.
+    """
+    _log("linux_make_directory", path=path, parents=parents, sudo=sudo)
+    flags = "-p" if parents else ""
+    return _run_ssh_cmd(
+        f"{_maybe_sudo(sudo)}mkdir {flags} {shlex.quote(path)} 2>&1 && echo OK"
+    )
+
+
+@mcp.tool()
+def linux_copy(
+    src: str, dst: str, recursive: bool = False, sudo: bool = False
+) -> str:
+    """Copy ``src`` to ``dst``.
+
+    Defaults to running unprivileged; pass ``sudo=True`` if either
+    endpoint is in a root-owned tree.
+    """
+    _log("linux_copy", src=src, dst=dst, recursive=recursive, sudo=sudo)
+    flags = "-r" if recursive else ""
+    return _run_ssh_cmd(
+        f"{_maybe_sudo(sudo)}cp {flags} {shlex.quote(src)} {shlex.quote(dst)} "
+        f"2>&1 && echo OK"
+    )
+
+
+@mcp.tool()
+def linux_move(src: str, dst: str, sudo: bool = False) -> str:
+    """Move/rename ``src`` to ``dst``.
+
+    Defaults to running unprivileged; pass ``sudo=True`` if either
+    endpoint is in a root-owned tree.
+    """
+    _log("linux_move", src=src, dst=dst, sudo=sudo)
+    return _run_ssh_cmd(
+        f"{_maybe_sudo(sudo)}mv {shlex.quote(src)} {shlex.quote(dst)} "
+        f"2>&1 && echo OK"
+    )
 
 
 @mcp.tool()
@@ -653,14 +710,23 @@ def _gdb_send(line: str, settle: float = 0.4, capture_lines: int = 80) -> str:
 
 
 @mcp.tool()
-def gdb_start_session_attach(pid: int) -> str:
-    """Attach gdb to a running process by PID inside a fresh tmux session."""
-    _log("gdb_start_session_attach", pid=pid)
-    return _gdb_start(f"sudo gdb -q -p {int(pid)}")
+def gdb_start_session_attach(pid: int, sudo: bool = True) -> str:
+    """Attach gdb to a running process by PID inside a fresh tmux session.
+
+    Defaults to ``sudo=True`` because attaching across UIDs (debugging a
+    systemd service running as root, a setuid binary, ...) requires
+    ptrace privileges. Pass ``sudo=False`` when attaching to a process
+    owned by the SUT login user (e.g. a foreground program you launched
+    yourself via ``linux_run_in_background``).
+    """
+    _log("gdb_start_session_attach", pid=pid, sudo=sudo)
+    return _gdb_start(f"{_maybe_sudo(sudo)}gdb -q -p {int(pid)}")
 
 
 @mcp.tool()
-def gdb_start_session_run(binary: str, args: str = "") -> str:
+def gdb_start_session_run(
+    binary: str, args: str = "", sudo: bool = False
+) -> str:
     """Open ``binary`` (with optional ``args``) under gdb in a fresh tmux session.
 
     The binary is LOADED but NOT EXECUTING. Typical workflow:
@@ -669,9 +735,13 @@ def gdb_start_session_run(binary: str, args: str = "") -> str:
         3. gdb_run()                        # actually starts the program
         4. gdb_continue / gdb_step / gdb_next / gdb_print ...
     Calling gdb_continue before gdb_run yields "The program is not being run".
+
+    Defaults to running unprivileged; pass ``sudo=True`` only when the
+    binary needs root to inspect/run (rare - ptrace of self does not
+    require it).
     """
-    _log("gdb_start_session_run", binary=binary, args=args)
-    inner = f"sudo gdb -q --args {shlex.quote(binary)} {args}".rstrip()
+    _log("gdb_start_session_run", binary=binary, args=args, sudo=sudo)
+    inner = f"{_maybe_sudo(sudo)}gdb -q --args {shlex.quote(binary)} {args}".rstrip()
     return _gdb_start(inner)
 
 
@@ -689,10 +759,17 @@ def gdb_run() -> str:
 
 
 @mcp.tool()
-def gdb_start_session_core(binary: str, core: str) -> str:
-    """Open a core dump for ``binary`` in a fresh tmux session."""
-    _log("gdb_start_session_core", binary=binary, core=core)
-    return _gdb_start(f"sudo gdb -q {shlex.quote(binary)} {shlex.quote(core)}")
+def gdb_start_session_core(binary: str, core: str, sudo: bool = False) -> str:
+    """Open a core dump for ``binary`` in a fresh tmux session.
+
+    Defaults to running unprivileged; pass ``sudo=True`` only when the
+    binary or core file lives in a root-owned tree the SUT user can't
+    read.
+    """
+    _log("gdb_start_session_core", binary=binary, core=core, sudo=sudo)
+    return _gdb_start(
+        f"{_maybe_sudo(sudo)}gdb -q {shlex.quote(binary)} {shlex.quote(core)}"
+    )
 
 
 @mcp.tool()
@@ -790,6 +867,159 @@ def gdb_quit() -> str:
     time.sleep(0.4)
     _gdb_kill_existing()
     return "gdb session closed"
+
+
+# --- rag_* (local LVGL docs retrieval) ----------------------------------------
+#
+# Unlike every other namespace in this server, rag_* does NOT touch the SUT.
+# It opens a local sqlite-vec store written by ``llama_debugger_vectordb``
+# and queries an embedding llama-server on the host (default
+# 127.0.0.1:53426). Both can be missing, so this namespace soft-fails:
+# instead of raising, every tool returns ``{"hits": [], "error": "..."}``
+# so the chat model gets an actionable hint without crashing the turn.
+#
+# Configurable via env vars (chosen at process start, set by run_mcp_cli.sh
+# or the operator's shell):
+#
+#   LLAMA_DEBUGGER_VECTORDB    Path to the .db file.
+#                              Default: systemd_mcp/vectordb/vector-database.db
+#   LLAMA_DEBUGGER_EMBED_HOST  Embedding server host. Default: 127.0.0.1
+#   LLAMA_DEBUGGER_EMBED_PORT  Embedding server port. Default: 53426
+#
+# Imports are deferred inside the tool body so the MCP server still starts
+# cleanly when numpy / sqlite-vec aren't installed (e.g. someone running
+# the agent without the vectordb extras).
+
+
+_RAG_DB_PATH_DEFAULT = "systemd_mcp/vectordb/vector-database.db"
+
+# Per-hit ``text`` length cap returned to the model. The ingester writes
+# chunks of up to ~2500 chars; multiplied by k=5 hits that's 12.5 KB per
+# rag_search call, and 4-5 calls per turn was overflowing the chat
+# server's 32k context window. The agent only needs a snippet to decide
+# whether a chunk is useful and to cite it; the full source is on disk
+# and can be pulled with linux_read_file if needed. 600 chars (~150-200
+# tokens) keeps a 5-call burst at ~3 KB / ~750 tokens of corpus content
+# in the conversation history.
+_RAG_HIT_TEXT_MAX_CHARS = int(
+    os.environ.get("LLAMA_DEBUGGER_RAG_TEXT_CHARS", "600")
+)
+
+
+def _rag_config() -> dict[str, Any]:
+    return {
+        "db_path": os.environ.get("LLAMA_DEBUGGER_VECTORDB", _RAG_DB_PATH_DEFAULT),
+        "embed_host": os.environ.get("LLAMA_DEBUGGER_EMBED_HOST", "127.0.0.1"),
+        "embed_port": int(os.environ.get("LLAMA_DEBUGGER_EMBED_PORT", "53426")),
+    }
+
+
+def _trim_hit_text(text: str, limit: int = _RAG_HIT_TEXT_MAX_CHARS) -> str:
+    """Cap a single hit's ``text`` to ``limit`` chars.
+
+    Keeps the head of the chunk: for code chunks the head is the function
+    signature / opening lines (the most diagnostic part); for docs the
+    head is the prose right after the heading. The ``heading`` and
+    ``path`` fields on the hit already give the agent everything it
+    needs to fetch the rest with ``linux_read_file`` if a particular
+    chunk turns out to matter.
+    """
+    if limit <= 0 or len(text) <= limit:
+        return text
+    extra = len(text) - limit
+    return (
+        text[:limit].rstrip()
+        + f"\n... [{extra} more chars in this chunk; "
+        f"read file for full context]"
+    )
+
+
+@mcp.tool()
+def rag_search(query: str, k: int = 5) -> dict[str, Any]:
+    """Search the LVGL docs vector DB and return the top-k matching chunks.
+
+    The DB must have been built once with ``llama_debugger_vectordb build``;
+    embedding requests go to the second llama-server started by
+    ``./start-llama-embedding-server.sh``. Both are checked at call time -
+    if either is missing, the tool returns ``{"hits": [], "error": "..."}``
+    rather than raising, so the chat keeps moving.
+
+    Each hit has ``score`` (cosine similarity in [0,1], higher is better),
+    ``path`` (relative to the LVGL repo, e.g. ``docs/src/widgets/label.mdx``),
+    ``heading`` (breadcrumb like "Animations > Common Components"),
+    ``title``, and ``text`` (the chunk content, truncated to keep the
+    chat server's context budget under control - override the cap via
+    the ``LLAMA_DEBUGGER_RAG_TEXT_CHARS`` env var). When a particular
+    hit looks promising and you need the full chunk, fetch the file
+    with ``linux_read_file(path)`` rather than re-querying with bigger k.
+    """
+    _log("rag_search", query=query, k=k)
+    cfg = _rag_config()
+    k = max(1, min(int(k), 20))
+
+    try:
+        from systemd_mcp.vectordb.embed import EmbeddingClient
+        from systemd_mcp.vectordb.store import VectorStore
+    except ImportError as exc:
+        return {
+            "hits": [],
+            "error": (
+                f"vectordb extras not installed ({exc}); run `poetry sync` "
+                f"to pick up numpy + sqlite-vec."
+            ),
+        }
+
+    if not os.path.exists(cfg["db_path"]):
+        return {
+            "hits": [],
+            "error": (
+                f"vector DB not found at {cfg['db_path']}; build it first "
+                f"with `poetry run llama_debugger_vectordb build` "
+                f"(or set LLAMA_DEBUGGER_VECTORDB to point elsewhere)."
+            ),
+        }
+
+    try:
+        with VectorStore(cfg["db_path"]) as store:
+            info = store.info()
+            if info["chunk_count"] == 0:
+                return {
+                    "hits": [],
+                    "error": (
+                        f"vector DB at {cfg['db_path']} is empty; rebuild "
+                        f"with `poetry run llama_debugger_vectordb build`."
+                    ),
+                }
+
+            embed = EmbeddingClient(host=cfg["embed_host"], port=cfg["embed_port"])
+            try:
+                qvec = embed.embed_query(query)
+            except Exception as exc:  # noqa: BLE001 - explicit soft-fail
+                return {
+                    "hits": [],
+                    "error": (
+                        f"embedding server at {embed.base_url} unreachable "
+                        f"({type(exc).__name__}: {exc}); start it with "
+                        f"`./start-llama-embedding-server.sh`."
+                    ),
+                }
+
+            hits = store.search(qvec, k=k)
+    except Exception as exc:  # noqa: BLE001 - bubble nothing into the chat
+        return {"hits": [], "error": f"rag_search failed: {type(exc).__name__}: {exc}"}
+
+    return {
+        "hits": [
+            {
+                "score": round(h.score, 4),
+                "path": h.path,
+                "heading": h.heading,
+                "title": h.title,
+                "text": _trim_hit_text(h.text),
+            }
+            for h in hits
+        ],
+    }
 
 
 def main() -> None:

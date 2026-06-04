@@ -78,15 +78,28 @@ the agent can repoint it at runtime via `configuration_setTargetHost`.
 re-using the same callables registered in `server.py`. Streams the
 `reasoning_content` (thinking) channel separately from the visible answer.
 
+**`start-llama-embedding-server.sh`** - launches a *second* `llama-server`
+instance on `http://0.0.0.0:53426` with `--embeddings --pooling mean` and a
+dedicated embedding GGUF (default `nomic-embed-text-v1.5.Q8_0`). The chat
+server on 53425 is left untouched - chat models make poor embedders, and a
+server in `--embeddings` mode is no good for generation.
+
+**`systemd_mcp/vectordb/`** - self-contained vector-DB demo. Embeds the
+[LVGL docs](https://github.com/lvgl/lvgl/tree/master/docs) (Markdown +
+MDX) through the embedding server above and stores the vectors in a
+single `sqlite-vec` file. Driven by the `llama_debugger_vectordb` CLI;
+see *Vector DB demo* below.
+
 ## Tool namespaces
 
 | Prefix              | Purpose                                                        |
 |---------------------|----------------------------------------------------------------|
 | `configuration_*`   | `setTargetHost(host, port, username, password)`, `getTargetHost`, `setRemoteEnv(name, value)`, `unsetRemoteEnv(name)`, `getRemoteEnv` |
 | `systemd_*`         | service status, journal, start/stop/restart/enable/disable, daemon-reload, list, uptime |
-| `linux_*`           | list/read/write/append/remove files, mkdir, cp, mv, find, grep, ps, df, which |
+| `linux_*`           | list/read/write/append/remove files, mkdir, cp, mv, find, grep, ps, df, which. Mutating tools (`write_file`, `append_file`, `remove`, `make_directory`, `copy`, `move`) take an optional `sudo: bool = False` flag - left off for the common user-space case (`/home/debian`, `/tmp`, build trees), set true only for root-owned trees (`/etc`, `/usr`, `/var`, `/opt`). |
 | `compiler_*`        | `gcc`, `make`, `cmake_configure`, `cmake_build`                |
-| `gdb_*`             | persistent tmux session: attach/run/core, send_command, break/continue/step/next/finish, print, backtrace, info_registers, info_threads, list_breakpoints, read_output, quit |
+| `gdb_*`             | persistent tmux session: attach/run/core (each takes optional `sudo`; `attach` defaults to `sudo=true` for ptrace across UIDs, `run` and `core` default off), send_command, break/continue/step/next/finish, print, backtrace, info_registers, info_threads, list_breakpoints, read_output, quit |
+| `rag_*`             | `search(query, k)` against the LVGL docs vector DB built by `llama_debugger_vectordb`. Soft-fails when the embedding server (port 53426) or the DB are missing - the chat continues, the model is told to advise rebuilding. |
 
 `gdb_*` keeps its state in a single tmux session (`llamadbg`) on the SUT, so
 breakpoints, stepping, and inspecting locals all work across MCP calls.
@@ -152,6 +165,150 @@ To stop QEMU:
 
 ```bash
 killall qemu-system-x86_64
+```
+
+## Vector DB demo (LVGL docs + source)
+
+llama.cpp itself is an inference engine - it computes embeddings via
+`llama-server --embeddings` (and the one-shot `llama-embedding` CLI), but
+it does **not** ship a vector database. The `systemd_mcp.vectordb`
+subpackage closes that gap with a thin local store on top of
+[`sqlite-vec`](https://github.com/asg017/sqlite-vec) and a CLI that can
+build, query, inspect, and wipe it.
+
+The demo corpus is **both halves** of the
+[`lvgl/lvgl`](https://github.com/lvgl/lvgl) repo:
+
+- **Documentation**: `docs/**/*.{md,mdx}` (~415 files / ~2.8k chunks).
+- **C source**: `src/**/*.{c,h}` and `examples/**/*.{c,h}` (~1285 files /
+  ~9k chunks). Each chunk is a ~50-line line-window; the chunk's
+  "heading" is the *enclosing* function name as captured by a
+  `^TYPE name(args) {` regex, so the agent can cite
+  `src/widgets/button/lv_button.c :: lv_button_create` or
+  `src/misc/lv_anim.c :: lv_anim_start`.
+
+`examples/assets/` (pre-encoded image/animation pixel arrays) and
+`src/font/` (bitmap font glyph tables) are excluded by default in
+[`systemd_mcp/vectordb/ingest.py`](systemd_mcp/vectordb/ingest.py)'s
+`DEFAULT_EXCLUDE_PREFIXES` - they're mechanical data, not retrievable
+prose, and would inflate the embedding cost by ~30% with no demo
+value. Re-enable by passing `exclude_prefixes=()` to `iter_source_files`.
+
+That gives the chat agent ~12k retrievable chunks covering both *what
+the API is supposed to do* (docs prose) and *what it actually does at
+the C level* (function bodies, structs, X-macro tables). It pairs
+naturally with this project since the SUT side is already wired to run
+`lvglsim` and other LVGL programs (see *Running GUI programs on the
+SUT*).
+
+### One-time setup
+
+Drop an embedding GGUF next to the chat model (path inside
+`start-llama-embedding-server.sh`). Recommended:
+
+```bash
+huggingface-cli download nomic-ai/nomic-embed-text-v1.5-GGUF \
+  nomic-embed-text-v1.5.Q8_0.gguf \
+  --local-dir ../llama.cpp/llama-b8532-bin-ubuntu-rocm-7.2-x64/llama-b8532
+```
+
+`bge-small-en-v1.5` (smaller) and `bge-m3` (multilingual) are listed as
+alternatives in the launcher; if you switch, also pass
+`--embed-family generic` to the CLI so it stops adding nomic's
+`search_document:` / `search_query:` prefixes.
+
+### Demo flow
+
+```bash
+./start-llama-server.sh                  # terminal 1: chat (port 53425)
+./start-llama-embedding-server.sh        # terminal 2: embeddings (port 53426)
+
+poetry sync                              # picks up sqlite-vec + numpy
+
+poetry run llama_debugger_vectordb build    # clones lvgl, embeds docs + src + examples
+poetry run llama_debugger_vectordb info     # backend, dim, chunk count, source commit
+poetry run llama_debugger_vectordb query "lv_anim opacity fade ready_cb" --k 5
+poetry run llama_debugger_vectordb delete --yes
+```
+
+**`build` is destructive and not fast.** It runs a sparse + partial +
+shallow `git clone` of `lvgl/lvgl` into `./.cache/lvgl/` (only `docs/`,
+`src/` and `examples/` materialize on disk; ~30 MB), then dispatches per
+file extension:
+
+- `.md` / `.mdx`: strip YAML frontmatter and MDX JSX components
+  (`<Callout>`, `<LvglExample>`, `<Figure>`, ...), split by `##` / `###`
+  headings, then ~800-char windows with 120-char overlap. Heading
+  breadcrumb is `H1 > H2 > H3`.
+- `.c` / `.h`: ~50-line windows with 8-line overlap. Heading is the
+  *enclosing function name* matched against
+  `^TYPE name(args) { ... }` (best-effort - misses are tagged with an
+  empty heading).
+
+Everything goes into `./systemd_mcp/vectordb/vector-database.db`
+(~50-80 MB; gitignored). Embedding
+takes ~5-15 minutes on the iGPU embedding server depending on its
+throughput - it's a one-shot cost; `info` lets you watch chunk_count
+climb in another terminal while it runs. Override the source with
+`--source` (git URL, path to a clone, or path directly at a leaf
+subdir) and the output with `--db`.
+
+`query` embeds your text via the same embedding server, runs an exact
+KNN against `sqlite-vec`, and prints the top-k chunks with the file
+path, heading (function name for code chunks), and a snippet.
+
+For a graphical alternative, `poetry run llama_debugger_vectordb_ui`
+opens a native (Toga/GTK) panel that streams `journalctl` over SSH into
+the store, runs the same searches, and manages the `.db` file - see
+[`systemd_mcp/vectordb_ui/README.md`](systemd_mcp/vectordb_ui/README.md).
+
+### Using the store from the chat agent
+
+Once the DB exists, the chat agent gets it for free: a `rag_search`
+tool is registered in [`systemd_mcp/server.py`](systemd_mcp/server.py)
+and surfaced through `llama_debugger_mcp_cli` (and the FastMCP server)
+under the `rag_*` namespace. The model's system prompt says the
+*hard* version: for any LVGL/`lv_*`/widget/animation/style task it
+**must** call `rag_search` at least once, **separately** for each
+distinct concept, and **must** cite the returned paths in its answer.
+With both the docs and the source code embedded, an answer typically
+mixes citations from `docs/src/...mdx` (prose) and `src/...c` (the
+actual function body), e.g.:
+
+```text
+> Add a button to my LVGL screen that, when clicked, fades its background
+> opacity from 100% to 0% over 800 ms then deletes itself. Use rag_search
+> separately for: button creation, click event, lv_anim opacity setup,
+> lv_anim ready_cb, lv_obj_delete. Cite the paths for every API.
+
+[tool_call rag_search query="lv_button_create parent" k=4]
+[tool_result hits=[{score:0.78, path:"src/widgets/button/lv_button.c",
+                    heading:"lv_button_create", text:"..."}, ...]]
+[tool_call rag_search query="lv_obj_add_event_cb LV_EVENT_CLICKED" k=4]
+[tool_call rag_search query="lv_anim_t opacity exec_cb lv_obj_set_style_bg_opa" k=4]
+[tool_call rag_search query="lv_anim_t ready_cb lv_obj_delete callback" k=4]
+[tool_call rag_search query="lv_obj_delete" k=3]
+... model writes the C code citing each src/... path ...
+```
+
+That's **5 distinct calls to `/v1/embeddings`** for one question. You'll
+see them stream past in the embedding-server terminal as
+`POST /v1/embeddings` lines, with the chat-server terminal idling at
+"all slots are idle" between them - i.e. the embedding GPU genuinely
+participates in every LVGL turn.
+
+`rag_search` **soft-fails** (returns `{"hits": [], "error": "..."}`) when
+either the embedding server or the DB is missing, so a chat session
+still works without `./start-llama-embedding-server.sh` or
+`llama_debugger_vectordb build`; the model just won't have grounding
+and will tell the user to start the missing piece.
+
+Override paths via env vars (handy if you ship a different corpus):
+
+```bash
+export LLAMA_DEBUGGER_VECTORDB=/path/to/my-corpus.db
+export LLAMA_DEBUGGER_EMBED_HOST=192.168.1.42
+export LLAMA_DEBUGGER_EMBED_PORT=53426
 ```
 
 ## Pointing at a different host

@@ -12,10 +12,25 @@ fastmcp = "<3"
 paramiko = "*"
 openai = "*"
 prompt-toolkit = "^3.0"
+# vectordb subpackage: numpy for vector math, sqlite-vec for the on-disk
+# ANN store (single-file SQLite extension, no daemon). httpx is pulled
+# transitively by openai so we don't declare it here.
+numpy = "*"
+sqlite-vec = "*"
+# vectordb_ui subpackage: Toga is BeeWare's native-widget GUI toolkit.
+# On Linux it renders through GTK, so toga-gtk (which pulls PyGObject)
+# is the backend. Pure Python + native bindings - installs cleanly on
+# 3.12, unlike the LVGL CPython binding it replaces. Optional at runtime:
+# the rest of the project (server, chat CLI, vectordb CLI) never imports
+# toga, so a headless box can skip these without breaking anything.
+toga = "*"
+toga-gtk = "*"
 
 [tool.poetry.scripts]
 systemd_mcp_server = "systemd_mcp.server:main"
 llama_debugger_mcp_cli = "systemd_mcp.cli:main"
+llama_debugger_vectordb = "systemd_mcp.vectordb.cli:main"
+llama_debugger_vectordb_ui = "systemd_mcp.vectordb_ui.cli:main"
 
 [build-system]
 requires = ["poetry-core"]
