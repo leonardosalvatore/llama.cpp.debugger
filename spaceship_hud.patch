@@ -1,0 +1,686 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index db3e381..09b37f7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -290,7 +290,7 @@ target_include_directories(lvgl_linux PUBLIC
+ # Link LVGL with external dependencies - Modern CMake/CMP0079 allows this
+ target_link_libraries(lvgl PUBLIC ${PKG_CONFIG_LIB} m pthread)
+ 
+-add_executable(lvglsim src/main.c ${LV_LINUX_SRC} ${LV_LINUX_BACKEND_SRC})
++add_executable(lvglsim src/main.c src/spaceship_hud.c src/hud_bg.c ${LV_LINUX_SRC} ${LV_LINUX_BACKEND_SRC})
+ target_link_libraries(lvglsim lvgl_linux lvgl)
+ 
+ 
+diff --git a/lv_conf.h b/lv_conf.h
+index 777466c..abded80 100644
+--- a/lv_conf.h
++++ b/lv_conf.h
+@@ -68,7 +68,7 @@
+ 
+ #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
+     /** Size of memory available for `lv_malloc()` in bytes (>= 2kB) */
+-    #define LV_MEM_SIZE (64 * 1024U)          /**< [bytes] */
++    #define LV_MEM_SIZE (256 * 1024U)          /**< [bytes] */
+ 
+     /** Size of the memory expand for `lv_malloc()` in bytes */
+     #define LV_MEM_POOL_EXPAND_SIZE 0
+diff --git a/src/main.c b/src/main.c
+index 5914061..2f6b501 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -29,6 +29,7 @@
+ #include "src/lib/driver_backends.h"
+ #include "src/lib/simulator_util.h"
+ #include "src/lib/simulator_settings.h"
++#include "src/spaceship_hud.h"
+ 
+ /* Internal functions */
+ static void configure_simulator(int argc, char **argv);
+@@ -149,9 +150,8 @@ int main(int argc, char **argv)
+     }
+ #endif
+ 
+-    /*Create a Demo*/
+-    lv_demo_widgets();
+-    lv_demo_widgets_start_slideshow();
++    /*Create the spaceship HUD demo*/
++    spaceship_hud_create();
+ 
+     /* Enter the run loop of the selected backend */
+     driver_backends_run_loop();
+diff --git a/src/spaceship_hud.c b/src/spaceship_hud.c
+new file mode 100644
+index 0000000..a5daca6
+--- /dev/null
++++ b/src/spaceship_hud.c
+@@ -0,0 +1,594 @@
++/**
++ * @file spaceship_hud.c
++ *
++ * A single-screen animated "spaceship HUD" demo for LVGL 9.x.
++ *
++ * Layout (800x480):
++ *   - full-screen nebula background (compiled-in RGB565 image) + a dark
++ *     gradient scrim for legibility
++ *   - top status bar: ship identity, live stardate/clock, status pill
++ *   - left panel : 5 animated system bars (shields/hull/reactor/fuel/O2)
++ *   - center     : a tactical scanner (concentric rings, crosshair,
++ *                  rotating sweep, pulsing contacts)
++ *   - right panel: 3 arc gauges (velocity / power / coolant) that ease
++ *                  smoothly toward changing targets
++ *   - bottom     : a scrolling "subspace flux" line chart + a marquee
++ *                  telemetry ticker
++ *
++ * Everything is driven by a few lv_timer / lv_anim instances; no blocking
++ * loops. State lives in a single file-static struct so timer callbacks
++ * don't need user-data plumbing.
++ */
++
++#include "spaceship_hud.h"
++
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++
++/* ---- palette -------------------------------------------------------- */
++#define COL_CYAN    lv_color_hex(0x35e8ff)
++#define COL_TEAL    lv_color_hex(0x0bd3d3)
++#define COL_DIM     lv_color_hex(0x0a5563)
++#define COL_AMBER   lv_color_hex(0xffb000)
++#define COL_RED     lv_color_hex(0xff4d4d)
++#define COL_GREEN   lv_color_hex(0x49ff8e)
++#define COL_PANEL   lv_color_hex(0x041019)
++#define COL_WHITE   lv_color_hex(0xd9fbff)
++
++#define RADAR_CX    400
++#define RADAR_CY    218
++#define RADAR_R     150
++
++/* ---- shared state --------------------------------------------------- */
++typedef struct {
++    lv_obj_t *clock_lbl;
++    lv_obj_t *date_lbl;
++    lv_obj_t *status_pill;
++    lv_obj_t *status_lbl;
++
++    lv_obj_t *bar[5];
++    lv_obj_t *bar_val[5];
++    int       bar_cur[5];
++    int       bar_tgt[5];
++
++    lv_obj_t *gauge[3];
++    lv_obj_t *gauge_val[3];
++    float     g_cur[3];
++    float     g_tgt[3];
++    int       g_min[3];
++    int       g_max[3];
++
++    lv_obj_t *sweep;
++    lv_obj_t *blip[4];
++
++    lv_obj_t *chart;
++    lv_chart_series_t *s_flux;
++    lv_chart_series_t *s_shield;
++    float     phase;
++
++    lv_obj_t *ticker;
++
++    bool      alert;
++    int       alert_hold;   /* ticks left in current alert state */
++    int       blink;
++} hud_t;
++
++static hud_t H;
++
++static const char *BAR_NAME[5] = {
++    "SHIELDS", "HULL", "REACTOR", "FUEL", "LIFE O2"
++};
++static const char *GAUGE_NAME[3] = { "VELOCITY", "POWER", "COOLANT" };
++static const char *GAUGE_UNIT[3] = { "km/s", "%", "\xC2\xB0""C" };
++
++/* ---- small helpers -------------------------------------------------- */
++
++static int rnd(int lo, int hi)
++{
++    return lo + (int)(rand() % (hi - lo + 1));
++}
++
++/* Translucent, rounded, cyan-bordered panel with an optional title. */
++static lv_obj_t *make_panel(lv_obj_t *parent, int x, int y, int w, int h,
++                            const char *title)
++{
++    lv_obj_t *p = lv_obj_create(parent);
++    lv_obj_set_pos(p, x, y);
++    lv_obj_set_size(p, w, h);
++    lv_obj_remove_flag(p, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_set_style_radius(p, 8, 0);
++    lv_obj_set_style_bg_color(p, COL_PANEL, 0);
++    lv_obj_set_style_bg_opa(p, LV_OPA_60, 0);
++    lv_obj_set_style_border_color(p, COL_TEAL, 0);
++    lv_obj_set_style_border_opa(p, LV_OPA_50, 0);
++    lv_obj_set_style_border_width(p, 1, 0);
++    lv_obj_set_style_pad_all(p, 10, 0);
++    lv_obj_set_style_shadow_color(p, COL_CYAN, 0);
++    lv_obj_set_style_shadow_width(p, 18, 0);
++    lv_obj_set_style_shadow_opa(p, LV_OPA_20, 0);
++
++    if(title) {
++        lv_obj_t *t = lv_label_create(p);
++        lv_label_set_text(t, title);
++        lv_obj_set_style_text_color(t, COL_CYAN, 0);
++        lv_obj_set_style_text_font(t, &lv_font_montserrat_16, 0);
++        lv_obj_set_style_text_letter_space(t, 2, 0);
++        lv_obj_align(t, LV_ALIGN_TOP_LEFT, 0, -2);
++    }
++    return p;
++}
++
++/* ---- animation exec callbacks --------------------------------------- */
++
++static void sweep_rot_cb(void *var, int32_t v)
++{
++    lv_arc_set_rotation((lv_obj_t *)var, v);
++}
++
++static void blip_opa_cb(void *var, int32_t v)
++{
++    lv_obj_set_style_bg_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
++    lv_obj_set_style_shadow_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
++}
++
++/* ---- builders ------------------------------------------------------- */
++
++static void build_background(lv_obj_t *scr)
++{
++    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
++
++    lv_obj_t *bg = lv_image_create(scr);
++    lv_image_set_src(bg, &hud_bg);
++    lv_obj_set_pos(bg, 0, 0);
++
++    /* Dark vertical scrim so white HUD text stays readable. */
++    lv_obj_t *scrim = lv_obj_create(scr);
++    lv_obj_remove_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_set_size(scrim, 800, 480);
++    lv_obj_set_pos(scrim, 0, 0);
++    lv_obj_set_style_border_width(scrim, 0, 0);
++    lv_obj_set_style_radius(scrim, 0, 0);
++    lv_obj_set_style_bg_color(scrim, lv_color_hex(0x000814), 0);
++    lv_obj_set_style_bg_opa(scrim, LV_OPA_40, 0);
++    lv_obj_set_style_bg_grad_color(scrim, lv_color_hex(0x00121f), 0);
++    lv_obj_set_style_bg_grad_dir(scrim, LV_GRAD_DIR_VER, 0);
++}
++
++static void build_topbar(lv_obj_t *scr)
++{
++    lv_obj_t *bar = make_panel(scr, 8, 6, 784, 56, NULL);
++    lv_obj_set_style_pad_all(bar, 8, 0);
++
++    lv_obj_t *name = lv_label_create(bar);
++    lv_label_set_text(name, "NEBULA");
++    lv_obj_set_style_text_color(name, COL_CYAN, 0);
++    lv_obj_set_style_text_font(name, &lv_font_montserrat_28, 0);
++    lv_obj_set_style_text_letter_space(name, 2, 0);
++    lv_obj_set_style_shadow_color(name, COL_CYAN, 0);
++    lv_obj_align(name, LV_ALIGN_LEFT_MID, 4, -6);
++
++    lv_obj_t *sub = lv_label_create(bar);
++    lv_label_set_text(sub, "NX-7  //  DEEP-SPACE RECON");
++    lv_obj_set_style_text_color(sub, COL_TEAL, 0);
++    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
++    lv_obj_set_style_text_letter_space(sub, 1, 0);
++    lv_obj_align(sub, LV_ALIGN_LEFT_MID, 6, 14);
++
++    /* status pill, centered */
++    H.status_pill = lv_obj_create(bar);
++    lv_obj_remove_flag(H.status_pill, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_set_size(H.status_pill, 230, 30);
++    lv_obj_align(H.status_pill, LV_ALIGN_CENTER, 0, 0);
++    lv_obj_set_style_radius(H.status_pill, 15, 0);
++    lv_obj_set_style_border_width(H.status_pill, 1, 0);
++    lv_obj_set_style_border_color(H.status_pill, COL_GREEN, 0);
++    lv_obj_set_style_bg_color(H.status_pill, COL_GREEN, 0);
++    lv_obj_set_style_bg_opa(H.status_pill, LV_OPA_20, 0);
++    lv_obj_set_style_pad_all(H.status_pill, 0, 0);
++
++    H.status_lbl = lv_label_create(H.status_pill);
++    lv_label_set_text(H.status_lbl, "ALL SYSTEMS NOMINAL");
++    lv_obj_set_style_text_color(H.status_lbl, COL_GREEN, 0);
++    lv_obj_set_style_text_font(H.status_lbl, &lv_font_montserrat_16, 0);
++    lv_obj_center(H.status_lbl);
++
++    /* clock + stardate, right */
++    H.clock_lbl = lv_label_create(bar);
++    lv_label_set_text(H.clock_lbl, "00:00:00");
++    lv_obj_set_style_text_color(H.clock_lbl, COL_WHITE, 0);
++    lv_obj_set_style_text_font(H.clock_lbl, &lv_font_montserrat_28, 0);
++    lv_obj_align(H.clock_lbl, LV_ALIGN_RIGHT_MID, -6, -6);
++
++    H.date_lbl = lv_label_create(bar);
++    lv_label_set_text(H.date_lbl, "STARDATE 00000.0");
++    lv_obj_set_style_text_color(H.date_lbl, COL_AMBER, 0);
++    lv_obj_set_style_text_font(H.date_lbl, &lv_font_montserrat_14, 0);
++    lv_obj_align(H.date_lbl, LV_ALIGN_RIGHT_MID, -6, 14);
++}
++
++static void build_left_panel(lv_obj_t *scr)
++{
++    lv_obj_t *p = make_panel(scr, 8, 70, 196, 300, "SYSTEMS");
++
++    for(int i = 0; i < 5; i++) {
++        int row_y = 36 + i * 50;
++
++        lv_obj_t *cap = lv_label_create(p);
++        lv_label_set_text(cap, BAR_NAME[i]);
++        lv_obj_set_style_text_color(cap, COL_WHITE, 0);
++        lv_obj_set_style_text_font(cap, &lv_font_montserrat_14, 0);
++        lv_obj_set_pos(cap, 2, row_y);
++
++        H.bar_val[i] = lv_label_create(p);
++        lv_label_set_text(H.bar_val[i], "--%");
++        lv_obj_set_style_text_color(H.bar_val[i], COL_CYAN, 0);
++        lv_obj_set_style_text_font(H.bar_val[i], &lv_font_montserrat_14, 0);
++        lv_obj_align(H.bar_val[i], LV_ALIGN_TOP_RIGHT, -2, row_y);
++
++        lv_obj_t *b = lv_bar_create(p);
++        lv_obj_set_size(b, 172, 12);
++        lv_obj_set_pos(b, 2, row_y + 20);
++        lv_bar_set_range(b, 0, 100);
++        lv_obj_set_style_radius(b, 6, 0);
++        lv_obj_set_style_bg_color(b, lv_color_hex(0x06222b), 0);
++        lv_obj_set_style_bg_opa(b, LV_OPA_70, 0);
++        lv_obj_set_style_border_width(b, 1, 0);
++        lv_obj_set_style_border_color(b, COL_DIM, 0);
++        /* indicator gradient */
++        lv_obj_set_style_radius(b, 6, LV_PART_INDICATOR);
++        lv_obj_set_style_bg_color(b, COL_TEAL, LV_PART_INDICATOR);
++        lv_obj_set_style_bg_grad_color(b, COL_CYAN, LV_PART_INDICATOR);
++        lv_obj_set_style_bg_grad_dir(b, LV_GRAD_DIR_HOR, LV_PART_INDICATOR);
++        lv_obj_set_style_shadow_color(b, COL_CYAN, LV_PART_INDICATOR);
++        lv_obj_set_style_shadow_width(b, 10, LV_PART_INDICATOR);
++        lv_obj_set_style_shadow_opa(b, LV_OPA_50, LV_PART_INDICATOR);
++
++        H.bar[i] = b;
++        H.bar_cur[i] = rnd(55, 95);
++        H.bar_tgt[i] = H.bar_cur[i];
++        lv_bar_set_value(b, H.bar_cur[i], LV_ANIM_OFF);
++    }
++}
++
++static lv_obj_t *make_gauge(lv_obj_t *parent, int x, int y, int d,
++                            lv_color_t col)
++{
++    lv_obj_t *a = lv_arc_create(parent);
++    lv_obj_set_size(a, d, d);
++    lv_obj_set_pos(a, x, y);
++    lv_arc_set_rotation(a, 135);
++    lv_arc_set_bg_angles(a, 0, 270);
++    lv_arc_set_range(a, 0, 100);
++    lv_arc_set_value(a, 50);
++    lv_obj_remove_flag(a, LV_OBJ_FLAG_CLICKABLE);
++    lv_obj_remove_style(a, NULL, LV_PART_KNOB);
++
++    lv_obj_set_style_arc_width(a, 8, LV_PART_MAIN);
++    lv_obj_set_style_arc_color(a, lv_color_hex(0x07303a), LV_PART_MAIN);
++    lv_obj_set_style_arc_width(a, 8, LV_PART_INDICATOR);
++    lv_obj_set_style_arc_color(a, col, LV_PART_INDICATOR);
++    lv_obj_set_style_shadow_color(a, col, LV_PART_INDICATOR);
++    return a;
++}
++
++static void build_right_panel(lv_obj_t *scr)
++{
++    lv_obj_t *p = make_panel(scr, 596, 70, 196, 300, "PROPULSION");
++
++    lv_color_t cols[3] = { COL_CYAN, COL_AMBER, COL_GREEN };
++    H.g_min[0] = 0;  H.g_max[0] = 300; /* velocity km/s */
++    H.g_min[1] = 0;  H.g_max[1] = 100; /* power % */
++    H.g_min[2] = 0;  H.g_max[2] = 120; /* coolant C */
++
++    for(int i = 0; i < 3; i++) {
++        int gy = 30 + i * 84;
++        H.gauge[i] = make_gauge(p, 8, gy, 74, cols[i]);
++
++        H.gauge_val[i] = lv_label_create(p);
++        lv_label_set_text(H.gauge_val[i], "0");
++        lv_obj_set_style_text_color(H.gauge_val[i], COL_WHITE, 0);
++        lv_obj_set_style_text_font(H.gauge_val[i], &lv_font_montserrat_20, 0);
++        lv_obj_align_to(H.gauge_val[i], H.gauge[i], LV_ALIGN_CENTER, 0, -2);
++
++        lv_obj_t *cap = lv_label_create(p);
++        lv_label_set_text_fmt(cap, "%s\n%s", GAUGE_NAME[i], GAUGE_UNIT[i]);
++        lv_obj_set_style_text_color(cap, cols[i], 0);
++        lv_obj_set_style_text_font(cap, &lv_font_montserrat_16, 0);
++        lv_obj_set_style_text_align(cap, LV_TEXT_ALIGN_LEFT, 0);
++        lv_obj_set_pos(cap, 94, gy + 18);
++
++        H.g_cur[i] = (float)rnd(H.g_min[i] + 10, H.g_max[i] - 30);
++        H.g_tgt[i] = H.g_cur[i];
++    }
++}
++
++static void build_radar(lv_obj_t *scr)
++{
++    lv_obj_t *title = lv_label_create(scr);
++    lv_label_set_text(title, "TACTICAL SCANNER");
++    lv_obj_set_style_text_color(title, COL_CYAN, 0);
++    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
++    lv_obj_set_style_text_letter_space(title, 2, 0);
++    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 74);
++
++    /* concentric rings */
++    for(int i = 1; i <= 3; i++) {
++        int d = (RADAR_R * 2 * i) / 3;
++        lv_obj_t *ring = lv_arc_create(scr);
++        lv_obj_set_size(ring, d, d);
++        lv_obj_align(ring, LV_ALIGN_TOP_LEFT, RADAR_CX - d / 2, RADAR_CY - d / 2);
++        lv_arc_set_bg_angles(ring, 0, 360);
++        lv_arc_set_value(ring, 0);
++        lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
++        lv_obj_remove_style(ring, NULL, LV_PART_KNOB);
++        lv_obj_remove_style(ring, NULL, LV_PART_INDICATOR);
++        lv_obj_set_style_arc_width(ring, 1, LV_PART_MAIN);
++        lv_obj_set_style_arc_color(ring, COL_TEAL, LV_PART_MAIN);
++        lv_obj_set_style_arc_opa(ring, LV_OPA_40, LV_PART_MAIN);
++    }
++
++    /* crosshair lines */
++    static lv_point_precise_t hpts[2];
++    static lv_point_precise_t vpts[2];
++    hpts[0].x = RADAR_CX - RADAR_R; hpts[0].y = RADAR_CY;
++    hpts[1].x = RADAR_CX + RADAR_R; hpts[1].y = RADAR_CY;
++    vpts[0].x = RADAR_CX; vpts[0].y = RADAR_CY - RADAR_R;
++    vpts[1].x = RADAR_CX; vpts[1].y = RADAR_CY + RADAR_R;
++
++    lv_obj_t *hl = lv_line_create(scr);
++    lv_line_set_points(hl, hpts, 2);
++    lv_obj_set_style_line_width(hl, 1, 0);
++    lv_obj_set_style_line_color(hl, COL_TEAL, 0);
++    lv_obj_set_style_line_opa(hl, LV_OPA_30, 0);
++
++    lv_obj_t *vl = lv_line_create(scr);
++    lv_line_set_points(vl, vpts, 2);
++    lv_obj_set_style_line_width(vl, 1, 0);
++    lv_obj_set_style_line_color(vl, COL_TEAL, 0);
++    lv_obj_set_style_line_opa(vl, LV_OPA_30, 0);
++
++    /* sweeping wedge: an arc whose rotation is animated */
++    H.sweep = lv_arc_create(scr);
++    int d = RADAR_R * 2;
++    lv_obj_set_size(H.sweep, d, d);
++    lv_obj_align(H.sweep, LV_ALIGN_TOP_LEFT, RADAR_CX - d / 2, RADAR_CY - d / 2);
++    lv_obj_remove_flag(H.sweep, LV_OBJ_FLAG_CLICKABLE);
++    lv_obj_remove_style(H.sweep, NULL, LV_PART_KNOB);
++    lv_arc_set_bg_angles(H.sweep, 0, 0);          /* hide bg track */
++    lv_arc_set_angles(H.sweep, 0, 45);            /* indicator wedge */
++    lv_obj_set_style_arc_opa(H.sweep, LV_OPA_0, LV_PART_MAIN);
++    lv_obj_set_style_arc_width(H.sweep, RADAR_R, LV_PART_INDICATOR);
++    lv_obj_set_style_arc_rounded(H.sweep, false, LV_PART_INDICATOR);
++    lv_obj_set_style_arc_color(H.sweep, COL_CYAN, LV_PART_INDICATOR);
++    lv_obj_set_style_arc_opa(H.sweep, LV_OPA_30, LV_PART_INDICATOR);
++
++    lv_anim_t a;
++    lv_anim_init(&a);
++    lv_anim_set_var(&a, H.sweep);
++    lv_anim_set_exec_cb(&a, sweep_rot_cb);
++    lv_anim_set_values(&a, 0, 360);
++    lv_anim_set_duration(&a, 2600);
++    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
++    lv_anim_start(&a);
++
++    /* center dot */
++    lv_obj_t *dot = lv_obj_create(scr);
++    lv_obj_remove_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
++    lv_obj_set_size(dot, 8, 8);
++    lv_obj_align(dot, LV_ALIGN_TOP_LEFT, RADAR_CX - 4, RADAR_CY - 4);
++    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
++    lv_obj_set_style_border_width(dot, 0, 0);
++    lv_obj_set_style_bg_color(dot, COL_CYAN, 0);
++
++    /* contacts (blips) with pulsing opacity */
++    int bx[4] = { RADAR_CX - 70, RADAR_CX + 48, RADAR_CX + 20, RADAR_CX - 36 };
++    int by[4] = { RADAR_CY - 40, RADAR_CY - 18, RADAR_CY + 56, RADAR_CY + 30 };
++    lv_color_t bc[4] = { COL_RED, COL_AMBER, COL_GREEN, COL_RED };
++    for(int i = 0; i < 4; i++) {
++        lv_obj_t *bl = lv_obj_create(scr);
++        lv_obj_remove_flag(bl, LV_OBJ_FLAG_SCROLLABLE);
++        lv_obj_set_size(bl, 9, 9);
++        lv_obj_align(bl, LV_ALIGN_TOP_LEFT, bx[i] - 4, by[i] - 4);
++        lv_obj_set_style_radius(bl, LV_RADIUS_CIRCLE, 0);
++        lv_obj_set_style_border_width(bl, 0, 0);
++        lv_obj_set_style_bg_color(bl, bc[i], 0);
++        lv_obj_set_style_shadow_color(bl, bc[i], 0);
++        lv_obj_set_style_shadow_width(bl, 12, 0);
++        H.blip[i] = bl;
++
++        lv_anim_t pa;
++        lv_anim_init(&pa);
++        lv_anim_set_var(&pa, bl);
++        lv_anim_set_exec_cb(&pa, blip_opa_cb);
++        lv_anim_set_values(&pa, LV_OPA_20, LV_OPA_COVER);
++        lv_anim_set_duration(&pa, 700 + i * 230);
++        lv_anim_set_playback_duration(&pa, 700 + i * 230);
++        lv_anim_set_repeat_count(&pa, LV_ANIM_REPEAT_INFINITE);
++        lv_anim_start(&pa);
++    }
++}
++
++static void build_bottom(lv_obj_t *scr)
++{
++    lv_obj_t *p = make_panel(scr, 8, 378, 784, 70, NULL);
++    lv_obj_set_style_pad_all(p, 6, 0);
++
++    lv_obj_t *cap = lv_label_create(p);
++    lv_label_set_text(cap, "SUBSPACE FLUX");
++    lv_obj_set_style_text_color(cap, COL_CYAN, 0);
++    lv_obj_set_style_text_font(cap, &lv_font_montserrat_14, 0);
++    lv_obj_align(cap, LV_ALIGN_TOP_LEFT, 2, -2);
++
++    H.chart = lv_chart_create(p);
++    lv_obj_set_size(H.chart, 470, 44);
++    lv_obj_align(H.chart, LV_ALIGN_LEFT_MID, 0, 4);
++    lv_chart_set_type(H.chart, LV_CHART_TYPE_LINE);
++    lv_chart_set_point_count(H.chart, 80);
++    lv_chart_set_update_mode(H.chart, LV_CHART_UPDATE_MODE_SHIFT);
++    lv_chart_set_range(H.chart, LV_CHART_AXIS_PRIMARY_Y, -110, 110);
++    lv_chart_set_div_line_count(H.chart, 3, 0);
++    lv_obj_set_style_bg_opa(H.chart, LV_OPA_0, 0);
++    lv_obj_set_style_border_width(H.chart, 0, 0);
++    lv_obj_set_style_line_color(H.chart, COL_DIM, LV_PART_MAIN);
++    lv_obj_set_style_size(H.chart, 0, 0, LV_PART_INDICATOR); /* no point dots */
++
++    H.s_flux = lv_chart_add_series(H.chart, COL_CYAN,
++                                   LV_CHART_AXIS_PRIMARY_Y);
++    H.s_shield = lv_chart_add_series(H.chart, COL_AMBER,
++                                     LV_CHART_AXIS_PRIMARY_Y);
++    for(int i = 0; i < 80; i++) {
++        lv_chart_set_next_value(H.chart, H.s_flux, 0);
++        lv_chart_set_next_value(H.chart, H.s_shield, 0);
++    }
++
++    /* right-side readout block */
++    lv_obj_t *ro = lv_label_create(p);
++    lv_label_set_text(ro,
++        "HEADING  287.4\xC2\xB0\n"
++        "WARP      6.2\n"
++        "DISTANCE  14.7 LY");
++    lv_obj_set_style_text_color(ro, COL_WHITE, 0);
++    lv_obj_set_style_text_font(ro, &lv_font_montserrat_14, 0);
++    lv_obj_set_style_text_line_space(ro, 2, 0);
++    lv_obj_align(ro, LV_ALIGN_RIGHT_MID, -4, 2);
++
++    /* marquee telemetry ticker pinned to the very bottom edge */
++    H.ticker = lv_label_create(scr);
++    lv_label_set_long_mode(H.ticker, LV_LABEL_LONG_SCROLL_CIRCULAR);
++    lv_obj_set_width(H.ticker, 784);
++    lv_label_set_text(H.ticker,
++        "   * NAV: course locked to Kepler-442b   "
++        "* COMMS: subspace link stable   "
++        "* SENSORS: 3 contacts tracked   "
++        "* ENGINEERING: dilithium matrix at 98%   "
++        "* SHIELDS: harmonics nominal   ");
++    lv_obj_set_style_text_color(H.ticker, COL_TEAL, 0);
++    lv_obj_set_style_text_font(H.ticker, &lv_font_montserrat_14, 0);
++    lv_obj_align(H.ticker, LV_ALIGN_BOTTOM_MID, 0, -2);
++}
++
++/* ---- timers --------------------------------------------------------- */
++
++static void set_status(bool alert)
++{
++    if(alert) {
++        lv_label_set_text(H.status_lbl, "! PROXIMITY ALERT !");
++        lv_obj_set_style_text_color(H.status_lbl, COL_RED, 0);
++        lv_obj_set_style_border_color(H.status_pill, COL_RED, 0);
++        lv_obj_set_style_bg_color(H.status_pill, COL_RED, 0);
++    } else {
++        lv_label_set_text(H.status_lbl, "ALL SYSTEMS NOMINAL");
++        lv_obj_set_style_text_color(H.status_lbl, COL_GREEN, 0);
++        lv_obj_set_style_border_color(H.status_pill, COL_GREEN, 0);
++        lv_obj_set_style_bg_color(H.status_pill, COL_GREEN, 0);
++        lv_obj_set_style_bg_opa(H.status_pill, LV_OPA_20, 0);
++    }
++}
++
++/* 33ms: smooth easing of gauges + bars, alert blink. */
++static void tick_cb(lv_timer_t *t)
++{
++    LV_UNUSED(t);
++
++    for(int i = 0; i < 3; i++) {
++        H.g_cur[i] += (H.g_tgt[i] - H.g_cur[i]) * 0.12f;
++        int span = H.g_max[i] - H.g_min[i];
++        int pct = (int)((H.g_cur[i] - H.g_min[i]) * 100.0f / span);
++        if(pct < 0) pct = 0;
++        if(pct > 100) pct = 100;
++        lv_arc_set_value(H.gauge[i], pct);
++        lv_label_set_text_fmt(H.gauge_val[i], "%d", (int)(H.g_cur[i] + 0.5f));
++    }
++
++    for(int i = 0; i < 5; i++) {
++        if(H.bar_cur[i] != H.bar_tgt[i]) {
++            H.bar_cur[i] += (H.bar_cur[i] < H.bar_tgt[i]) ? 1 : -1;
++            lv_bar_set_value(H.bar[i], H.bar_cur[i], LV_ANIM_OFF);
++            lv_label_set_text_fmt(H.bar_val[i], "%d%%", H.bar_cur[i]);
++        }
++    }
++
++    if(H.alert) {
++        H.blink++;
++        lv_opa_t o = (H.blink / 8) % 2 ? LV_OPA_50 : LV_OPA_10;
++        lv_obj_set_style_bg_opa(H.status_pill, o, 0);
++    }
++}
++
++/* ~130ms: push new telemetry samples into the chart. */
++static void flux_cb(lv_timer_t *t)
++{
++    LV_UNUSED(t);
++    H.phase += 0.32f;
++    int flux = (int)(70.0f * sinf(H.phase)
++                     + 25.0f * sinf(H.phase * 2.7f)
++                     + rnd(-12, 12));
++    int shield = (int)(45.0f * sinf(H.phase * 0.6f + 1.0f) + rnd(-8, 8));
++    lv_chart_set_next_value(H.chart, H.s_flux, flux);
++    lv_chart_set_next_value(H.chart, H.s_shield, shield);
++}
++
++/* 1s: clock + stardate. */
++static void clock_cb(lv_timer_t *t)
++{
++    LV_UNUSED(t);
++    time_t now = time(NULL);
++    struct tm *tm = localtime(&now);
++    lv_label_set_text_fmt(H.clock_lbl, "%02d:%02d:%02d",
++                          tm->tm_hour, tm->tm_min, tm->tm_sec);
++    double secs = tm->tm_yday * 86400.0 + tm->tm_hour * 3600.0
++                  + tm->tm_min * 60.0 + tm->tm_sec;
++    double stardate = 47000.0 + secs / 86.4;
++    lv_label_set_text_fmt(H.date_lbl, "STARDATE %.1f", stardate);
++}
++
++/* ~2.2s: pick new gauge/bar targets and occasionally raise an alert. */
++static void retarget_cb(lv_timer_t *t)
++{
++    LV_UNUSED(t);
++    for(int i = 0; i < 3; i++)
++        H.g_tgt[i] = (float)rnd(H.g_min[i] + 8, H.g_max[i] - 8);
++    for(int i = 0; i < 5; i++)
++        H.bar_tgt[i] = rnd(45, 100);
++
++    if(H.alert_hold > 0) {
++        H.alert_hold--;
++        if(H.alert_hold == 0) {
++            H.alert = false;
++            set_status(false);
++        }
++    } else if(rnd(0, 4) == 0) {
++        H.alert = true;
++        H.alert_hold = 2;
++        set_status(true);
++    }
++}
++
++/* ---- entry ---------------------------------------------------------- */
++
++void spaceship_hud_create(void)
++{
++    srand((unsigned)time(NULL));
++    lv_memzero(&H, sizeof(H));
++
++    lv_obj_t *scr = lv_screen_active();
++    lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
++
++    build_background(scr);
++    build_topbar(scr);
++    build_left_panel(scr);
++    build_right_panel(scr);
++    build_radar(scr);
++    build_bottom(scr);
++    set_status(false);
++
++    lv_timer_create(tick_cb, 33, NULL);
++    lv_timer_create(flux_cb, 130, NULL);
++    lv_timer_create(clock_cb, 1000, NULL);
++    lv_timer_create(retarget_cb, 2200, NULL);
++
++    /* prime the readouts immediately */
++    clock_cb(NULL);
++}
+diff --git a/src/spaceship_hud.h b/src/spaceship_hud.h
+new file mode 100644
+index 0000000..9d63644
+--- /dev/null
++++ b/src/spaceship_hud.h
+@@ -0,0 +1,30 @@
++/**
++ * @file spaceship_hud.h
++ *
++ * Single-screen fictional spaceship HUD built with LVGL 9.x.
++ * Entry point used by src/main.c instead of the stock widgets demo.
++ */
++#ifndef SPACESHIP_HUD_H
++#define SPACESHIP_HUD_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#include "lvgl/lvgl.h"
++
++/* Compiled-in 800x480 RGB565 background (generated by LVGLImage.py,
++ * lives in src/hud_bg.c). */
++extern const lv_image_dsc_t hud_bg;
++
++/**
++ * Build the whole HUD on the active screen. Creates all widgets,
++ * animations and timers; returns immediately (the run loop drives it).
++ */
++void spaceship_hud_create(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* SPACESHIP_HUD_H */
