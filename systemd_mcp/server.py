@@ -239,21 +239,46 @@ def _log(name: str, **kwargs: Any) -> None:
 # --- configuration_* ----------------------------------------------------------
 
 
+# Redaction / placeholder strings a model tends to invent for a password
+# field it doesn't actually know - it frequently echoes back the "***" it
+# saw from configuration_getTargetHost, or a literal "redacted". Treat these
+# as "leave unchanged" so a stray configuration_setTargetHost call can't
+# clobber the working SUT credentials and lock the agent out (which then
+# surfaces as AuthenticationException on every later tool call).
+_PLACEHOLDER_SECRETS = {
+    "", "*", "**", "***", "****", "redacted", "<redacted>", "[redacted]",
+    "changeme", "password", "your_password", "none", "null", "xxx",
+}
+
+
 @mcp.tool()
 def configuration_setTargetHost(
-    host: str = "127.0.0.1",
-    port: int = 2222,
-    username: str = "debian",
-    password: str = "debian",
+    host: str | None = None,
+    port: int | None = None,
+    username: str | None = None,
+    password: str | None = None,
 ) -> str:
     """Point all subsequent tools at a different SSH target.
 
-    Defaults to the QEMU SUT exposed by ``run_linux_in_qemu.sh``
-    (127.0.0.1:2222, debian/debian).
+    Only the fields you pass are changed; omitted (or null) fields keep
+    their current value, so you can retarget just the host/port without
+    resupplying the password. NEVER invent a password: a value that looks
+    like a redaction placeholder ("***", "redacted", ...) is ignored rather
+    than applied, so a mistaken call can't break working credentials. You
+    rarely need this at all - the initial target is already the QEMU SUT
+    from run_linux_in_qemu.sh (127.0.0.1:2222, debian/debian).
     """
-    _log("configuration_setTargetHost", host=host, port=port, username=username)
-    _TARGET.update(host=host, port=int(port), username=username, password=password)
-    return f"Target set to {username}@{host}:{port}"
+    if host:
+        _TARGET["host"] = host
+    if port:
+        _TARGET["port"] = int(port)
+    if username:
+        _TARGET["username"] = username
+    if password is not None and password.strip().lower() not in _PLACEHOLDER_SECRETS:
+        _TARGET["password"] = password
+    _log("configuration_setTargetHost", host=_TARGET["host"],
+         port=_TARGET["port"], username=_TARGET["username"])
+    return f"Target set to {_TARGET['username']}@{_TARGET['host']}:{_TARGET['port']}"
 
 
 @mcp.tool()
@@ -962,7 +987,13 @@ def perf_record(
     # of the target. `bash -c 'single cmd'` exec-optimizes into the target, so
     # `timeout`'s SIGINT still reaches it directly.
     target = f"timeout --signal=INT {dur} bash -c {shlex.quote(command)}"
+    # Delete any stale profile first (output is an absolute path, so cwd is
+    # irrelevant here). Without this, a recording that captures no useful
+    # samples - or a run where the target failed to launch - would leave the
+    # PREVIOUS run's perf.data in place, and perf_report / perf_heatmap would
+    # silently visualize old data.
     cmd = (
+        f"{_maybe_sudo(sudo)}rm -f {shlex.quote(output)} 2>/dev/null; "
         f"{prefix}{_maybe_sudo(sudo)}perf record -F {int(frequency)} {cg}"
         f"-o {shlex.quote(output)} -- {target} "
         f"2>&1; echo --rc=$?--"

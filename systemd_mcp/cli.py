@@ -142,12 +142,19 @@ _BOOL = {"type": "boolean"}
 TOOL_SPEC: List[Dict[str, Any]] = [
     _tool(
         "configuration_setTargetHost",
-        "Point all subsequent tools at a different SSH target. Defaults match the QEMU SUT.",
+        "Point all subsequent tools at a different SSH target. You RARELY "
+        "need this - the default target is already the QEMU SUT. Only the "
+        "fields you pass are changed; omit the ones you don't want to touch. "
+        "This does NOT set environment variables on the SUT - use "
+        "configuration_setRemoteEnv for that (e.g. XAUTHORITY).",
         {
             "host": {**_STR, "description": "Hostname or IP of the SUT."},
             "port": {**_INT, "description": "SSH port (default 2222)."},
             "username": _STR,
-            "password": _STR,
+            "password": {**_STR, "description":
+                         "SSH password. NEVER invent or guess this and never "
+                         "pass a placeholder like '***' or 'redacted' - omit "
+                         "the field to keep the current password."},
         },
     ),
     _tool(
