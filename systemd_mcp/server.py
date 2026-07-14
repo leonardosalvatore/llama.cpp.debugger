@@ -918,9 +918,12 @@ def perf_stat(
     prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
     ev = f"-e {shlex.quote(events)} " if events else ""
     box = f"timeout --signal=INT {int(duration)} " if int(duration) > 0 else ""
+    # Wrap in `bash -c` (see perf_record) so `command` is shell-parsed: inline
+    # env prefixes (`XAUTHORITY=... ./app`), pipes, and quoting all work.
+    target = f"{box}bash -c {shlex.quote(command)}"
     cap = (int(duration) + _PERF_RECORD_TIMEOUT_PAD) if int(duration) > 0 else 120.0
     return _run_ssh_cmd(
-        f"{prefix}{_maybe_sudo(sudo)}perf stat {ev}-- {box}{command} 2>&1; echo --rc=$?--",
+        f"{prefix}{_maybe_sudo(sudo)}perf stat {ev}-- {target} 2>&1; echo --rc=$?--",
         timeout=cap,
     )
 
@@ -951,9 +954,17 @@ def perf_record(
     prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
     cg = "-g " if call_graph else ""
     dur = max(1, int(duration))
+    # Run the profiled command through `bash -c` so shell syntax and inline
+    # env-var prefixes (e.g. `XAUTHORITY=... ./app -flag`) work. `timeout` and
+    # `perf` exec their argv directly (no shell), so without this wrapper a
+    # command like `FOO=bar ./app` makes timeout try to exec a program named
+    # literally "FOO=bar" and fail with rc=127 - profiling the wrapper instead
+    # of the target. `bash -c 'single cmd'` exec-optimizes into the target, so
+    # `timeout`'s SIGINT still reaches it directly.
+    target = f"timeout --signal=INT {dur} bash -c {shlex.quote(command)}"
     cmd = (
         f"{prefix}{_maybe_sudo(sudo)}perf record -F {int(frequency)} {cg}"
-        f"-o {shlex.quote(output)} -- timeout --signal=INT {dur} {command} "
+        f"-o {shlex.quote(output)} -- {target} "
         f"2>&1; echo --rc=$?--"
     )
     return _run_ssh_cmd(cmd, timeout=dur + _PERF_RECORD_TIMEOUT_PAD)
