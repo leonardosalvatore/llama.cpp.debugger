@@ -56,6 +56,30 @@ _REMOTE_ENV: dict[str, str] = {
     "DISPLAY": ":0",
 }
 
+
+def _seed_remote_env_from_environ() -> None:
+    """Merge ``LLAMA_DEBUGGER_REMOTE_ENV`` (``K=V,K=V``) into ``_REMOTE_ENV``.
+
+    Lets a launcher (e.g. ``run_mcp_demo.sh``) pre-set SUT env vars such as
+    ``XAUTHORITY`` deterministically at startup, so the model never has to
+    call ``configuration_setRemoteEnv`` for them - small models tend to
+    confuse that with ``configuration_setTargetHost`` and derail.
+    """
+    raw = os.environ.get("LLAMA_DEBUGGER_REMOTE_ENV", "").strip()
+    if not raw:
+        return
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if key:
+            _REMOTE_ENV[key] = value.strip()
+
+
+_seed_remote_env_from_environ()
+
 # Persistent tmux session name used by all gdb_* tools on the target host.
 _GDB_TMUX = "llamadbg"
 
@@ -236,6 +260,41 @@ def _log(name: str, **kwargs: Any) -> None:
     print(f"[llama.cpp.debugger] {name}({args})", file=sys.stderr, flush=True)
 
 
+def _probe_ssh(
+    host: str, port: int, username: str, password: str, timeout: float = 8.0
+) -> tuple[str, str]:
+    """Test-connect to an SSH target WITHOUT touching the live ``_TARGET``.
+
+    Returns ``("ok", "")`` on success, ``("auth", detail)`` when the
+    credentials are rejected, or ``("unreachable", detail)`` for any
+    network / timeout / protocol failure. ``configuration_setTargetHost``
+    uses this to validate a change before committing it, so a wrong password
+    guess can never lock the agent out of a working SUT.
+    """
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(
+            host,
+            port=int(port),
+            username=username,
+            password=password,
+            allow_agent=False,
+            look_for_keys=False,
+            timeout=timeout,
+        )
+        return ("ok", "")
+    except paramiko.AuthenticationException as exc:
+        return ("auth", f"{type(exc).__name__}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        return ("unreachable", f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            ssh.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # --- configuration_* ----------------------------------------------------------
 
 
@@ -262,22 +321,59 @@ def configuration_setTargetHost(
 
     Only the fields you pass are changed; omitted (or null) fields keep
     their current value, so you can retarget just the host/port without
-    resupplying the password. NEVER invent a password: a value that looks
-    like a redaction placeholder ("***", "redacted", ...) is ignored rather
-    than applied, so a mistaken call can't break working credentials. You
-    rarely need this at all - the initial target is already the QEMU SUT
-    from run_linux_in_qemu.sh (127.0.0.1:2222, debian/debian).
+    resupplying the password. The change is VALIDATED with a quick test
+    connection before it takes effect: if authentication fails the change is
+    rejected and the previous working target is kept, so a wrong/guessed
+    password can never lock the agent out. NEVER invent a password (redaction
+    placeholders like "***" / "redacted" are ignored too). You rarely need
+    this at all - the initial target is already the QEMU SUT from
+    run_linux_in_qemu.sh (127.0.0.1:2222, debian/debian). To set an env var
+    on the SUT (e.g. XAUTHORITY) use configuration_setRemoteEnv instead.
     """
+    candidate = dict(_TARGET)
     if host:
-        _TARGET["host"] = host
+        candidate["host"] = host
     if port:
-        _TARGET["port"] = int(port)
+        candidate["port"] = int(port)
     if username:
-        _TARGET["username"] = username
+        candidate["username"] = username
     if password is not None and password.strip().lower() not in _PLACEHOLDER_SECRETS:
-        _TARGET["password"] = password
+        candidate["password"] = password
+
+    if candidate == _TARGET:
+        _log("configuration_setTargetHost", unchanged=True,
+             host=_TARGET["host"], port=_TARGET["port"],
+             username=_TARGET["username"])
+        return (
+            f"Target unchanged: {_TARGET['username']}@{_TARGET['host']}:"
+            f"{_TARGET['port']} (nothing to update)."
+        )
+
+    kind, detail = _probe_ssh(
+        candidate["host"], candidate["port"],
+        candidate["username"], candidate["password"],
+    )
+    if kind == "auth":
+        _log("configuration_setTargetHost", rejected="auth",
+             host=candidate["host"], port=candidate["port"],
+             username=candidate["username"])
+        return (
+            f"Target NOT changed: authentication failed for "
+            f"{candidate['username']}@{candidate['host']}:{candidate['port']} "
+            f"({detail}). Kept the previous working target "
+            f"{_TARGET['username']}@{_TARGET['host']}:{_TARGET['port']}. Never "
+            f"guess credentials - omit fields you don't want to change."
+        )
+
+    _TARGET.update(candidate)
     _log("configuration_setTargetHost", host=_TARGET["host"],
          port=_TARGET["port"], username=_TARGET["username"])
+    if kind == "unreachable":
+        return (
+            f"Target set to {_TARGET['username']}@{_TARGET['host']}:"
+            f"{_TARGET['port']}, but it is not reachable yet ({detail}); "
+            f"tools will start working once it is up."
+        )
     return f"Target set to {_TARGET['username']}@{_TARGET['host']}:{_TARGET['port']}"
 
 

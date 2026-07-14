@@ -145,7 +145,9 @@ TOOL_SPEC: List[Dict[str, Any]] = [
         "Point all subsequent tools at a different SSH target. You RARELY "
         "need this - the default target is already the QEMU SUT. Only the "
         "fields you pass are changed; omit the ones you don't want to touch. "
-        "This does NOT set environment variables on the SUT - use "
+        "The change is validated with a test connection and REJECTED (the "
+        "previous target kept) if authentication fails - so never guess a "
+        "password. This does NOT set environment variables on the SUT - use "
         "configuration_setRemoteEnv for that (e.g. XAUTHORITY).",
         {
             "host": {**_STR, "description": "Hostname or IP of the SUT."},
