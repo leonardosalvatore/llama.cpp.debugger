@@ -379,6 +379,10 @@ TOOL_SPEC: List[Dict[str, Any]] = [
           "wants to explore the profile interactively (vs the static heatmap). "
           "Requires hotspot installed on the host.",
           {"data_file": _STR, "local_path": _STR, "with_symbols": _BOOL,
+           "use_debuginfod": {**_BOOL, "description": "Query DEBUGINFOD_URLS "
+            "for missing symbols (default false; leaving it off avoids Hotspot "
+            "stalling on 'Loading Results...' when SUT distro libs aren't on "
+            "the debuginfod server)."},
            "sudo": {**_BOOL, "description": "Run perf via sudo (default false)."}}),
 
     _tool("rag_search",

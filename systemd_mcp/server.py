@@ -1274,6 +1274,7 @@ def perf_open_hotspot(
     data_file: str = _PERF_DEFAULT_DATA,
     local_path: str = "",
     with_symbols: bool = True,
+    use_debuginfod: bool = False,
     sudo: bool = False,
 ) -> dict[str, Any]:
     """Copy a perf.data off the SUT and open it in Hotspot on the host.
@@ -1283,12 +1284,21 @@ def perf_open_hotspot(
     detached. When ``with_symbols`` (default), it first runs ``perf archive``
     on the SUT to bundle the build-id'd binaries/libraries and extracts them
     into the host build-id cache (``~/.debug``) so Hotspot can resolve SUT
-    symbols across machines. Returns ``{"opened": bool, "local_path": ...,
-    "symbols": ...}``; soft-fails with an ``error`` if ``hotspot`` is not on
-    the host PATH or the perf.data is missing. Requires a prior perf_record.
+    symbols across machines.
+
+    ``use_debuginfod`` is False by default: Hotspot's perfparser otherwise
+    queries any configured ``DEBUGINFOD_URLS`` for every unresolved build-id,
+    which stalls indefinitely ("Loading Results...") when the SUT's distro
+    libraries aren't on that server. Since the build-id archive already
+    supplies the relevant symbols, we disable debuginfod for the launched
+    Hotspot unless this is set True.
+
+    Returns ``{"opened": bool, "local_path": ..., "symbols": ...}``;
+    soft-fails with an ``error`` if ``hotspot`` is not on the host PATH or the
+    perf.data is missing. Requires a prior perf_record.
     """
     _log("perf_open_hotspot", data_file=data_file, local_path=local_path or None,
-         with_symbols=with_symbols, sudo=sudo)
+         with_symbols=with_symbols, use_debuginfod=use_debuginfod, sudo=sudo)
     hotspot = shutil.which("hotspot")
     if hotspot is None:
         return {
@@ -1321,12 +1331,18 @@ def perf_open_hotspot(
             "error": f"failed to copy perf.data to host: {type(exc).__name__}: {exc}",
         }
 
+    env = os.environ.copy()
+    if not use_debuginfod:
+        # Empty (not unset) so elfutils' debuginfod client stays disabled even
+        # if a system-wide /etc/debuginfod/*.urls would otherwise apply.
+        env["DEBUGINFOD_URLS"] = ""
     try:
         subprocess.Popen(
             [hotspot, local_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=env,
         )
     except Exception as exc:  # noqa: BLE001
         return {
