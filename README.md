@@ -26,7 +26,10 @@ line to pick a different GGUF.
 **`run_linux_in_qemu.sh`** - boots a Debian 12 cloud image inside QEMU
 (NAT'd, with SSH host-forwarded to `127.0.0.1:2222`). Cloud-init injects the
 `debian` / `debian` credentials and pre-installs the toolchain the agent
-needs (`tmux`, `gdb`, `gcc`, `g++`, `make`, `cmake`). Image source:
+needs (`tmux`, `gdb`, `gcc`, `g++`, `make`, `cmake`, plus `linux-perf` and
+`bzip2` for the `perf_*` tools). It also relaxes `kernel.perf_event_paranoid`
+so the unprivileged `debian` user can record profiles without `sudo`. Image
+source:
 <https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2>.
 To use the Debian shell, press Enter and log in as `debian` / `debian`.
 
@@ -99,6 +102,7 @@ see *Vector DB demo* below.
 | `linux_*`           | list/read/write/append/remove files, mkdir, cp, mv, find, grep, ps, df, which. Mutating tools (`write_file`, `append_file`, `remove`, `make_directory`, `copy`, `move`) take an optional `sudo: bool = False` flag - left off for the common user-space case (`/home/debian`, `/tmp`, build trees), set true only for root-owned trees (`/etc`, `/usr`, `/var`, `/opt`). |
 | `compiler_*`        | `gcc`, `make`, `cmake_configure`, `cmake_build`                |
 | `gdb_*`             | persistent tmux session: attach/run/core (each takes optional `sudo`; `attach` defaults to `sudo=true` for ptrace across UIDs, `run` and `core` default off), send_command, break/continue/step/next/finish, print, backtrace, info_registers, info_threads, list_breakpoints, read_output, quit |
+| `perf_*`            | Linux `perf` profiling: `stat` (cycles/IPC/cache summary), `record` (time-boxed sampling, works for GUI/long-running programs), `report`, `top_functions` (JSON), `heatmap` (renders a function-overhead treemap PNG on the host), `open_hotspot` (pulls the recording to the host and opens it in the interactive [Hotspot](https://github.com/KDAB/hotspot) GUI with cross-machine symbols). See *Profiling demo* below. |
 | `rag_*`             | `search(query, k)` against the LVGL docs vector DB built by `llama_debugger_vectordb`. Soft-fails when the embedding server (port 53426) or the DB are missing - the chat continues, the model is told to advise rebuilding. |
 
 `gdb_*` keeps its state in a single tmux session (`llamadbg`) on the SUT, so
@@ -167,6 +171,56 @@ To stop QEMU:
 killall qemu-system-x86_64
 ```
 
+## Profiling demo (perf → heatmap / Hotspot)
+
+The `perf_*` tools let the agent CPU-profile a program on the SUT and bring
+the result back to the host for visualization. `perf_record` is time-boxed
+(via `timeout`), so it works even for GUI / never-returning programs like the
+LVGL simulator: the agent just says "record this for N seconds".
+
+**`run_mcp_demo.sh`** wires the whole flow end-to-end against
+`lvglsim -b GLFW`. It does the model-unfriendly setup *itself*
+(deterministically) so even a small model only has to make the two tool
+calls that matter:
+
+```bash
+GUI=1 GUI_ACCEL=1 ./run_linux_in_qemu.sh   # SUT with the LVGL sim built
+./start-llama-server.sh                    # chat model
+./run_mcp_demo.sh                          # profile + visualize
+```
+
+What it does:
+
+- Copies the live display-manager X cookie to a `debian`-readable path and
+  exports `XAUTHORITY` (via `LLAMA_DEBUGGER_REMOTE_ENV`) so the GUI program
+  can open its window - the model never touches SSH creds or X cookies.
+- Prompts the agent to `perf_record` the sim, then `perf_heatmap` it.
+- When the chat finishes, opens the rendered heatmap PNG (`xdg-open`) and,
+  by default, the raw profile in **Hotspot** (`OPEN_HOTSPOT=0` to skip).
+
+Tunables (env): `LVGLSIM_BIN`, `LVGLSIM_ARGS`, `PERF_DURATION`,
+`HEATMAP_PNG`, `SUT_PERF_DATA`, `OPEN_HOTSPOT`.
+
+### Two ways to view a profile
+
+- **Heatmap PNG** (`perf_heatmap`) - pulls the hottest functions over SSH and
+  renders a squarified treemap on the *host* with `matplotlib` (tile area =
+  self-overhead, color = blue-cold → red-hot). Headless (Agg backend), so it
+  works over SSH with no display. Returns `{png, functions, count}`.
+- **Hotspot GUI** (`perf_open_hotspot`) - Hotspot runs on the *host* but
+  `perf.data` lives on the SUT, so the tool copies the recording over SFTP
+  and, by default, runs `perf archive` on the SUT to bundle the build-id'd
+  binaries/libraries, extracting them into the host build-id cache
+  (`~/.debug`) so SUT symbols resolve **across machines**. It launches
+  Hotspot with debuginfod disabled (`DEBUGINFOD_URLS=""`) - otherwise the
+  parser stalls on "Loading Results..." querying a debuginfod server for the
+  SUT's distro libs; the archive already supplies the symbols. Pass
+  `use_debuginfod=true` to opt back in.
+
+Both soft-fail cleanly: `perf_heatmap` if `matplotlib` is missing on the
+host, `perf_open_hotspot` if `hotspot` isn't on the host `PATH` or there's
+no recording yet.
+
 ## Vector DB demo (LVGL docs + source)
 
 llama.cpp itself is an inference engine - it computes embeddings via
@@ -209,7 +263,7 @@ Drop an embedding GGUF next to the chat model (path inside
 ```bash
 huggingface-cli download nomic-ai/nomic-embed-text-v1.5-GGUF \
   nomic-embed-text-v1.5.Q8_0.gguf \
-  --local-dir ../llama.cpp/llama-b8532-bin-ubuntu-rocm-7.2-x64/llama-b8532
+  --local-dir ../llama.cpp/llama-b9940-bin-ubuntu-rocm-7.2-x64/llama-b9940
 ```
 
 `bge-small-en-v1.5` (smaller) and `bge-m3` (multilingual) are listed as
@@ -351,16 +405,18 @@ and the persistent gdb tmux session.
 
 **Host:** `poetry`, `genisoimage` (or `cloud-localds` / `mkisofs`),
 `qemu-system-x86_64`, the ROCm-built `llama-server` referenced by
-`start-llama-server.sh`. For `GUI=1` mode also: KVM access (your user in
-the `kvm` group, or `/dev/kvm` otherwise readable+writable). For
-`GUI_ACCEL=1` additionally: `libvirglrenderer1` for virgl host-OpenGL
-passthrough.
+`start-llama-server.sh`. `matplotlib` (pulled in by `poetry sync`) for
+`perf_heatmap`, and optionally `hotspot` for `perf_open_hotspot`. For
+`GUI=1` mode also: KVM access (your user in the `kvm` group, or `/dev/kvm`
+otherwise readable+writable). For `GUI_ACCEL=1` additionally:
+`libvirglrenderer1` for virgl host-OpenGL passthrough.
 
 **SUT:** `tmux` and `gdb` are required for `gdb_*` tools; `gcc`, `g++`, `make`
-and `cmake` for `compiler_*`. On Debian/Ubuntu:
+and `cmake` for `compiler_*`; `linux-perf` (and `bzip2`, used by
+`perf archive`) for `perf_*`. On Debian/Ubuntu:
 
 ```bash
-sudo apt-get install -y tmux gdb gcc g++ make cmake
+sudo apt-get install -y tmux gdb gcc g++ make cmake linux-perf bzip2
 ```
 
 ## MCP notes
