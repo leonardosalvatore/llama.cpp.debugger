@@ -32,6 +32,9 @@ LVGLSIM_ARGS="${LVGLSIM_ARGS:--b GLFW}"
 PERF_DURATION="${PERF_DURATION:-12}"
 HEATMAP_PNG="${HEATMAP_PNG:-/tmp/lvglsim_heatmap.png}"
 SUT_XAUTH="${SUT_XAUTH:-/tmp/xauth.debian}"
+SUT_PERF_DATA="${SUT_PERF_DATA:-/tmp/llamadbg_perf.data}"
+# OPEN_HOTSPOT=0 to skip launching the Hotspot GUI at the end.
+OPEN_HOTSPOT="${OPEN_HOTSPOT:-1}"
 
 # Ensure the venv matches the lock file (run_mcp_cli.sh also does this; it is
 # idempotent, and we need the deps below for the pre-flight X setup).
@@ -76,4 +79,21 @@ for arg in "$@"; do
   fi
 done
 
-exec "$SCRIPT_DIR/run_mcp_cli.sh" --single "${FLAGS[@]+"${FLAGS[@]}"}" "$DEMO_PROMPT"
+"$SCRIPT_DIR/run_mcp_cli.sh" --single "${FLAGS[@]+"${FLAGS[@]}"}" "$DEMO_PROMPT"
+
+# Open the rendered heatmap in the host's default image viewer once the chat
+# finishes. Guarded so a missing file or no xdg-open doesn't error out.
+if command -v xdg-open >/dev/null 2>&1 && [ -f "$HEATMAP_PNG" ]; then
+  xdg-open "$HEATMAP_PNG" >/dev/null 2>&1 || true
+fi
+
+# Also pull the raw perf.data off the SUT and open it in Hotspot (interactive
+# flame graph / caller-callee), with build-id symbols. Set OPEN_HOTSPOT=0 to
+# skip. Non-fatal if hotspot isn't installed - the tool soft-fails.
+if [ "$OPEN_HOTSPOT" = "1" ]; then
+  poetry run python - "$SUT_PERF_DATA" <<'PY' || true
+import sys, json
+from systemd_mcp import server as srv
+print(json.dumps(srv.perf_open_hotspot.fn(data_file=sys.argv[1]), indent=2))
+PY
+fi

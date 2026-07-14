@@ -86,8 +86,9 @@ DEFAULT_SYSTEM_PROMPT = (
     "  `perf_record(command='/path/bin -flags', duration=10)` (time-boxed, so "
     "it works for GUI/long-running programs) -> `perf_top_functions()` to see "
     "the hottest symbols as JSON -> `perf_heatmap()` to render a treemap PNG "
-    "on the host and return its path. Use `perf_stat` for a quick "
-    "cycles/IPC/cache-miss summary without a full recording.\n"
+    "on the host and return its path, or `perf_open_hotspot()` to open the "
+    "recording in the interactive Hotspot GUI on the host. Use `perf_stat` "
+    "for a quick cycles/IPC/cache-miss summary without a full recording.\n"
     "\n"
     "Rules to avoid wasted tool calls:\n"
     "* To execute a shell command on the SUT, call `linux_run_command` "
@@ -369,6 +370,15 @@ TOOL_SPEC: List[Dict[str, Any]] = [
           {"data_file": _STR, "output_png": _STR,
            "limit": {**_INT, "minimum": 1, "maximum": 200},
            "title": _STR,
+           "sudo": {**_BOOL, "description": "Run perf via sudo (default false)."}}),
+    _tool("perf_open_hotspot",
+          "Copy a perf.data off the SUT and open it in the Hotspot GUI "
+          "(interactive flame graph / caller-callee) on the HOST. Pulls the "
+          "recording over SFTP and, by default, a `perf archive` build-id "
+          "bundle so SUT symbols resolve across machines. Use when the user "
+          "wants to explore the profile interactively (vs the static heatmap). "
+          "Requires hotspot installed on the host.",
+          {"data_file": _STR, "local_path": _STR, "with_symbols": _BOOL,
            "sudo": {**_BOOL, "description": "Run perf via sudo (default false)."}}),
 
     _tool("rag_search",

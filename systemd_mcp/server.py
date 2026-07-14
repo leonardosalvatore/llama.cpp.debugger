@@ -10,7 +10,9 @@ a configurable target host (defaults to the QEMU SUT brought up by
 * ``gdb_*``        - debugger control via a persistent ``tmux`` session
 * ``perf_*``       - Linux ``perf`` profiling (stat / record / report /
                      top_functions), plus ``perf_heatmap`` which renders a
-                     function-overhead treemap PNG on the host.
+                     function-overhead treemap PNG on the host and
+                     ``perf_open_hotspot`` which opens the recording in the
+                     interactive Hotspot GUI on the host.
 * ``configuration_*`` - point the agent at a different target host
 * ``rag_*``        - dense retrieval (``rag_search``) over the LVGL docs
                      vector DB built by ``llama_debugger_vectordb`` (uses the
@@ -22,8 +24,12 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import socket
+import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 from typing import Any
 
@@ -1234,6 +1240,139 @@ def perf_heatmap(
             "error": f"heatmap render failed: {type(exc).__name__}: {exc}",
         }
     return {"png": out, "functions": funcs, "count": len(funcs)}
+
+
+# Host path the SUT perf.data is copied to before opening it in Hotspot.
+_HOST_PERF_DEFAULT = os.path.join(tempfile.gettempdir(), "llamadbg_perf.data")
+
+
+def _sftp_get(remote_path: str, local_path: str) -> None:
+    """Copy ``remote_path`` from the SUT to ``local_path`` on the host via SFTP."""
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    ssh.connect(
+        _TARGET["host"],
+        port=int(_TARGET["port"]),
+        username=_TARGET["username"],
+        password=_TARGET["password"],
+        allow_agent=False,
+        look_for_keys=False,
+        timeout=10.0,
+    )
+    try:
+        sftp = ssh.open_sftp()
+        try:
+            sftp.get(remote_path, local_path)
+        finally:
+            sftp.close()
+    finally:
+        ssh.close()
+
+
+@mcp.tool()
+def perf_open_hotspot(
+    data_file: str = _PERF_DEFAULT_DATA,
+    local_path: str = "",
+    with_symbols: bool = True,
+    sudo: bool = False,
+) -> dict[str, Any]:
+    """Copy a perf.data off the SUT and open it in Hotspot on the host.
+
+    Hotspot (the KDAB perf GUI) runs on the HOST, but the recording lives on
+    the SUT, so this pulls it over SFTP and launches ``hotspot`` on it,
+    detached. When ``with_symbols`` (default), it first runs ``perf archive``
+    on the SUT to bundle the build-id'd binaries/libraries and extracts them
+    into the host build-id cache (``~/.debug``) so Hotspot can resolve SUT
+    symbols across machines. Returns ``{"opened": bool, "local_path": ...,
+    "symbols": ...}``; soft-fails with an ``error`` if ``hotspot`` is not on
+    the host PATH or the perf.data is missing. Requires a prior perf_record.
+    """
+    _log("perf_open_hotspot", data_file=data_file, local_path=local_path or None,
+         with_symbols=with_symbols, sudo=sudo)
+    hotspot = shutil.which("hotspot")
+    if hotspot is None:
+        return {
+            "opened": False,
+            "error": "hotspot not found on host PATH; install it (e.g. `apt install hotspot`).",
+        }
+    local_path = local_path or _HOST_PERF_DEFAULT
+
+    check = _run_ssh_cmd(
+        f"test -s {shlex.quote(data_file)} && echo OK || echo MISSING"
+    )
+    if "OK" not in check:
+        return {
+            "opened": False,
+            "error": (
+                f"no usable perf.data at {data_file} on the SUT - run "
+                f"perf_record first."
+            ),
+        }
+
+    symbols_note = "not requested"
+    if with_symbols:
+        symbols_note = _perf_pull_symbols(data_file, local_path, sudo)
+
+    try:
+        _sftp_get(data_file, local_path)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "opened": False,
+            "error": f"failed to copy perf.data to host: {type(exc).__name__}: {exc}",
+        }
+
+    try:
+        subprocess.Popen(
+            [hotspot, local_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "opened": False,
+            "local_path": local_path,
+            "error": f"failed to launch hotspot: {type(exc).__name__}: {exc}",
+        }
+    return {"opened": True, "local_path": local_path, "symbols": symbols_note}
+
+
+def _perf_pull_symbols(data_file: str, local_path: str, sudo: bool) -> str:
+    """Best-effort: bundle SUT build-id objects via ``perf archive`` and
+    extract them into the host ``~/.debug`` cache for cross-machine symbols.
+
+    Returns a short human-readable status; never raises (symbol resolution
+    is a nice-to-have, not a hard requirement for opening the profile).
+    """
+    try:
+        remote_dir = os.path.dirname(data_file) or "."
+        remote_base = os.path.basename(data_file)
+        out = _run_ssh_cmd(
+            f"cd {shlex.quote(remote_dir)} && "
+            f"{_maybe_sudo(sudo)}perf archive {shlex.quote(remote_base)} 2>&1; "
+            f"ls -1 {shlex.quote(remote_base)}.tar.bz2 2>/dev/null",
+            timeout=120.0,
+        )
+        remote_tar = None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.endswith(".tar.bz2"):
+                remote_tar = line if line.startswith("/") else os.path.join(remote_dir, line)
+        if not remote_tar:
+            return "perf archive produced no bundle; SUT symbols may show as addresses"
+
+        local_tar = local_path + ".tar.bz2"
+        _sftp_get(remote_tar, local_tar)
+        debug_dir = os.path.expanduser("~/.debug")
+        os.makedirs(debug_dir, exist_ok=True)
+        with tarfile.open(local_tar, "r:*") as tf:
+            try:
+                tf.extractall(debug_dir, filter="data")  # py>=3.12
+            except TypeError:
+                tf.extractall(debug_dir)
+        return f"build-id symbols extracted to {debug_dir}"
+    except Exception as exc:  # noqa: BLE001
+        return f"symbol archive skipped ({type(exc).__name__}: {exc})"
 
 
 # --- rag_* (local LVGL docs retrieval) ----------------------------------------

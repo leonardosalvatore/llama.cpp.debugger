@@ -143,7 +143,10 @@ runcmd:
 ${DESKTOP_GETTY_RUNCMD}
   - [ bash, -c, "DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1 || true" ]
   - [ bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get update -y" ]
-  - [ bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux gdb gcc g++ make cmake git linux-perf" ]
+  # bzip2 is required by \`perf archive\` (used by the perf_open_hotspot MCP
+  # tool to bundle build-id'd binaries so Hotspot on the host can resolve
+  # SUT symbols across machines).
+  - [ bash, -c, "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tmux gdb gcc g++ make cmake git linux-perf bzip2" ]
   # Relax perf paranoia so the unprivileged 'debian' user can record
   # userspace + kernel samples without sudo (the perf_* MCP tools still
   # accept a sudo flag for anything that needs it). Persisted via a
