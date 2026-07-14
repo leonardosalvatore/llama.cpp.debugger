@@ -8,6 +8,9 @@ a configurable target host (defaults to the QEMU SUT brought up by
 * ``linux_*``      - generic filesystem and process inspection
 * ``compiler_*``   - gcc / g++ / make / cmake invocations
 * ``gdb_*``        - debugger control via a persistent ``tmux`` session
+* ``perf_*``       - Linux ``perf`` profiling (stat / record / report /
+                     top_functions), plus ``perf_heatmap`` which renders a
+                     function-overhead treemap PNG on the host.
 * ``configuration_*`` - point the agent at a different target host
 * ``rag_*``        - dense retrieval (``rag_search``) over the LVGL docs
                      vector DB built by ``llama_debugger_vectordb`` (uses the
@@ -273,7 +276,7 @@ def configuration_setRemoteEnv(name: str, value: str) -> str:
     ``DISPLAY=:0`` (default) or ``XAUTHORITY=/home/debian/.Xauthority``.
     Pre-set: DISPLAY=:0.
     """
-    _log("configuration_setRemoteEnv", name=name, value=value)
+    _log("configuration_setRemoteEnv", var=name, value=value)
     _REMOTE_ENV[name] = value
     return f"Remote env updated: {name}={value}"
 
@@ -281,7 +284,7 @@ def configuration_setRemoteEnv(name: str, value: str) -> str:
 @mcp.tool()
 def configuration_unsetRemoteEnv(name: str) -> str:
     """Drop ``name`` from the always-exported remote env."""
-    _log("configuration_unsetRemoteEnv", name=name)
+    _log("configuration_unsetRemoteEnv", var=name)
     existed = _REMOTE_ENV.pop(name, None) is not None
     return f"Remote env removed: {name}" if existed else f"Remote env had no {name}"
 
@@ -867,6 +870,232 @@ def gdb_quit() -> str:
     time.sleep(0.4)
     _gdb_kill_existing()
     return "gdb session closed"
+
+
+# --- perf_* (Linux perf profiling on the target) ------------------------------
+#
+# All perf tools run over SSH on the SUT. Profiling a long-running or GUI
+# program (e.g. ``lvglsim -b GLFW``) means ``perf record`` has to be
+# time-boxed, otherwise it never returns and the SSH channel hangs until the
+# hard timeout. ``perf_record`` therefore wraps the target command in
+# ``timeout`` so recording stops on its own and the channel is released.
+#
+# The recorded ``perf.data`` stays on the SUT. ``perf_report`` /
+# ``perf_top_functions`` parse it into text / JSON, and ``perf_heatmap``
+# pulls that JSON back and renders a treemap heatmap PNG *on the host*
+# running this server (see ``systemd_mcp.perf_heatmap``), so the operator or
+# agent can display it directly.
+#
+# perf needs a relaxed ``kernel.perf_event_paranoid`` (set to -1 by the
+# cloud-init provisioning in ``run_linux_in_qemu.sh``) to record as the
+# unprivileged ``debian`` user; every tool also accepts ``sudo=True`` as a
+# fallback on hosts that were not provisioned that way.
+
+_PERF_DEFAULT_DATA = "/tmp/llamadbg_perf.data"
+
+# Extra head-room added to a recording's ``duration`` when sizing the SSH
+# channel timeout, to cover perf's own startup + post-processing (symbol
+# resolution, writing perf.data) after the profiled command exits.
+_PERF_RECORD_TIMEOUT_PAD = 45.0
+
+
+@mcp.tool()
+def perf_stat(
+    command: str, cwd: str = "", events: str = "", duration: int = 0, sudo: bool = False
+) -> str:
+    """Run ``perf stat`` on ``command`` and return the counter summary.
+
+    Quick top-line view (cycles, instructions, IPC, cache/branch misses,
+    context switches, task-clock) without recording a full profile. Pass a
+    comma-separated ``events`` list to override the default counter set. For
+    a long-running / GUI program set ``duration`` (seconds) so it is
+    time-boxed with ``timeout``; for a program that exits on its own leave
+    it at 0. Use ``perf_record`` + ``perf_report`` / ``perf_heatmap`` for a
+    per-function breakdown.
+    """
+    _log("perf_stat", command=command, cwd=cwd or None, events=events or None,
+         duration=duration, sudo=sudo)
+    prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+    ev = f"-e {shlex.quote(events)} " if events else ""
+    box = f"timeout --signal=INT {int(duration)} " if int(duration) > 0 else ""
+    cap = (int(duration) + _PERF_RECORD_TIMEOUT_PAD) if int(duration) > 0 else 120.0
+    return _run_ssh_cmd(
+        f"{prefix}{_maybe_sudo(sudo)}perf stat {ev}-- {box}{command} 2>&1; echo --rc=$?--",
+        timeout=cap,
+    )
+
+
+@mcp.tool()
+def perf_record(
+    command: str,
+    cwd: str = "",
+    duration: int = 10,
+    frequency: int = 999,
+    call_graph: bool = True,
+    output: str = _PERF_DEFAULT_DATA,
+    sudo: bool = False,
+) -> str:
+    """Sample ``command`` with ``perf record`` for ``duration`` seconds, then stop.
+
+    ``command`` is time-boxed with ``timeout`` so long-running / GUI
+    programs (lvglsim, glxgears, a daemon, ...) stop recording on their own
+    and this call returns. Records at ``frequency`` Hz and, when
+    ``call_graph`` is set (default), captures the call graph so
+    ``perf_report`` can build a caller/callee tree. Writes the profile to
+    ``output`` on the SUT (default ``/tmp/llamadbg_perf.data``). Returns
+    perf's own record summary; follow with ``perf_report`` /
+    ``perf_top_functions`` / ``perf_heatmap`` to read it.
+    """
+    _log("perf_record", command=command, cwd=cwd or None, duration=duration,
+         frequency=frequency, call_graph=call_graph, output=output, sudo=sudo)
+    prefix = f"cd {shlex.quote(cwd)} && " if cwd else ""
+    cg = "-g " if call_graph else ""
+    dur = max(1, int(duration))
+    cmd = (
+        f"{prefix}{_maybe_sudo(sudo)}perf record -F {int(frequency)} {cg}"
+        f"-o {shlex.quote(output)} -- timeout --signal=INT {dur} {command} "
+        f"2>&1; echo --rc=$?--"
+    )
+    return _run_ssh_cmd(cmd, timeout=dur + _PERF_RECORD_TIMEOUT_PAD)
+
+
+@mcp.tool()
+def perf_report(
+    data_file: str = _PERF_DEFAULT_DATA, limit: int = 40, sudo: bool = False
+) -> str:
+    """Return a text ``perf report`` (symbol overhead table) for ``data_file``."""
+    _log("perf_report", data_file=data_file, limit=limit, sudo=sudo)
+    return _run_ssh_cmd(
+        f"{_maybe_sudo(sudo)}perf report -i {shlex.quote(data_file)} --stdio "
+        f"--percent-limit 0.1 2>&1 | head -n {int(limit) + 20}",
+        timeout=120.0,
+    )
+
+
+def _parse_perf_report(text: str, limit: int) -> list[dict[str, Any]]:
+    """Extract ``(percent, command, dso, symbol)`` rows from ``perf report --stdio``.
+
+    Matches the flat (self-overhead) layout::
+
+        23.45%  lvglsim  liblvgl.so         [.] lv_draw_sw_blend
+        10.11%  lvglsim  [kernel.kallsyms]  [k] copy_user_generic
+
+    The single-letter map marker (``[.]`` user, ``[k]`` kernel, ...) anchors
+    the split between the shared-object and symbol columns, which is more
+    robust than counting whitespace when a DSO path contains spaces.
+    """
+    import re
+
+    rx = re.compile(
+        r"^\s*(\d+\.\d+)%\s+(\S+)\s+(.+?)\s+(\[[.\w]\])\s+(.+?)\s*$"
+    )
+    out: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = rx.match(line)
+        if not m:
+            continue
+        out.append(
+            {
+                "percent": float(m.group(1)),
+                "command": m.group(2),
+                "dso": m.group(3).strip(),
+                "kind": m.group(4),
+                "symbol": m.group(5).strip(),
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _perf_top_functions_impl(
+    data_file: str, limit: int, sudo: bool
+) -> dict[str, Any]:
+    limit = max(1, min(int(limit), 200))
+    # --no-children collapses the report to a single self-overhead column
+    # even when perf.data carries call-graph info (otherwise perf emits both
+    # a Children and a Self column, which would misalign the parser and, more
+    # importantly, plot inclusive time rather than where the CPU actually is).
+    raw = _run_ssh_cmd(
+        f"{_maybe_sudo(sudo)}perf report -i {shlex.quote(data_file)} --stdio "
+        f"-g none --no-children --percent-limit 0.01 2>&1",
+        timeout=120.0,
+    )
+    funcs = _parse_perf_report(raw, limit)
+    if not funcs:
+        return {"functions": [], "count": 0, "error": _truncate(raw)}
+    return {"functions": funcs, "count": len(funcs)}
+
+
+@mcp.tool()
+def perf_top_functions(
+    data_file: str = _PERF_DEFAULT_DATA, limit: int = 25, sudo: bool = False
+) -> dict[str, Any]:
+    """Return the hottest functions in ``data_file`` as structured JSON.
+
+    Parses a flat (self-overhead) ``perf report`` into a list of
+    ``{percent, command, dso, kind, symbol}`` sorted hottest first. This is
+    the machine-readable form ``perf_heatmap`` renders into a PNG. Soft-fails
+    with ``functions=[]`` + an ``error`` string (raw perf output) when the
+    data file is missing or has no resolvable samples.
+    """
+    _log("perf_top_functions", data_file=data_file, limit=limit, sudo=sudo)
+    return _perf_top_functions_impl(data_file, limit, sudo)
+
+
+@mcp.tool()
+def perf_heatmap(
+    data_file: str = _PERF_DEFAULT_DATA,
+    output_png: str = "",
+    limit: int = 30,
+    title: str = "",
+    sudo: bool = False,
+) -> dict[str, Any]:
+    """Render a function-level CPU heatmap PNG from a ``perf.data`` on the SUT.
+
+    Pulls the hottest functions (``perf_top_functions``) over SSH, then
+    renders a treemap *on the host running this server* (not the SUT): each
+    tile is a function, sized by its CPU self-overhead and colored on a
+    blue(cold)->red(hot) heat scale. Returns ``{"png": <local path>,
+    "functions": [...], "count": N}`` so the operator/agent can open/display
+    the image directly. Soft-fails with an ``error`` string when there are no
+    samples or matplotlib is not installed (``poetry sync`` to add it).
+    """
+    _log("perf_heatmap", data_file=data_file, output_png=output_png or None,
+         limit=limit, title=title or None, sudo=sudo)
+    result = _perf_top_functions_impl(data_file, limit, sudo)
+    funcs = result.get("functions", [])
+    if not funcs:
+        return {
+            "png": "",
+            "functions": [],
+            "error": result.get("error", "no samples parsed from perf.data"),
+        }
+    try:
+        from systemd_mcp.perf_heatmap import render_heatmap
+    except ImportError as exc:
+        return {
+            "png": "",
+            "functions": funcs,
+            "error": (
+                f"heatmap rendering needs matplotlib ({exc}); run `poetry sync`."
+            ),
+        }
+    out = output_png or os.path.abspath("perf_heatmap.png")
+    try:
+        render_heatmap(
+            funcs, out, title=title or f"perf function heatmap ({data_file})"
+        )
+    except Exception as exc:  # noqa: BLE001 - keep the chat alive
+        return {
+            "png": "",
+            "functions": funcs,
+            "error": f"heatmap render failed: {type(exc).__name__}: {exc}",
+        }
+    return {"png": out, "functions": funcs, "count": len(funcs)}
 
 
 # --- rag_* (local LVGL docs retrieval) ----------------------------------------

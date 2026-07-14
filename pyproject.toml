@@ -17,6 +17,11 @@ prompt-toolkit = "^3.0"
 # transitively by openai so we don't declare it here.
 numpy = "*"
 sqlite-vec = "*"
+# perf_* profiling tools: matplotlib renders the function-overhead treemap
+# heatmap (systemd_mcp/perf_heatmap.py) on the host from perf.data pulled
+# off the SUT. Agg backend, so it works headless. perf_heatmap soft-fails
+# with an actionable error if this is missing.
+matplotlib = "*"
 # vectordb_ui subpackage: Toga is BeeWare's native-widget GUI toolkit.
 # On Linux it renders through GTK, so toga-gtk (which pulls PyGObject)
 # is the backend. Pure Python + native bindings - installs cleanly on

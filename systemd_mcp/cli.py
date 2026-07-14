@@ -42,6 +42,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "  linux_*         filesystem and process inspection\n"
     "  compiler_*      gcc / g++ / make / cmake builds\n"
     "  gdb_*           debugger control via a persistent tmux session\n"
+    "  perf_*          Linux perf profiling (stat / record / report / "
+    "top_functions / heatmap)\n"
     "  configuration_* point the agent at a different SSH target\n"
     "  rag_*           dense retrieval over the local vector DB. The corpus "
     "contains BOTH the official docs (docs/src/*.md, *.mdx) AND the actual "
@@ -79,6 +81,13 @@ DEFAULT_SYSTEM_PROMPT = (
     "`linux_run_in_background(command='./binary')` returns PID -> "
     "`gdb_start_session_attach(pid)` -> `gdb_break(location)` -> "
     "`gdb_continue` (the inferior is already running, no `gdb_run` needed).\n"
+    "\n"
+    "PERF workflow for profiling / 'why is X slow' / 'show a heatmap':\n"
+    "  `perf_record(command='/path/bin -flags', duration=10)` (time-boxed, so "
+    "it works for GUI/long-running programs) -> `perf_top_functions()` to see "
+    "the hottest symbols as JSON -> `perf_heatmap()` to render a treemap PNG "
+    "on the host and return its path. Use `perf_stat` for a quick "
+    "cycles/IPC/cache-miss summary without a full recording.\n"
     "\n"
     "Rules to avoid wasted tool calls:\n"
     "* To execute a shell command on the SUT, call `linux_run_command` "
@@ -307,6 +316,51 @@ TOOL_SPEC: List[Dict[str, Any]] = [
     _tool("gdb_info_threads", "Show all threads (`info threads`)."),
     _tool("gdb_list_breakpoints", "Show all current breakpoints (`info breakpoints`)."),
     _tool("gdb_quit", "Quit the active gdb session and tear down the tmux pane."),
+
+    _tool("perf_stat",
+          "Run `perf stat` on a command and return the counter summary "
+          "(cycles, instructions, IPC, cache/branch misses, context switches). "
+          "For a long-running / GUI program set duration (seconds) so it is "
+          "time-boxed; leave duration=0 for a program that exits on its own. "
+          "Use perf_record + perf_report/perf_heatmap for a per-function breakdown.",
+          {"command": _STR, "cwd": _STR, "events": _STR,
+           "duration": {**_INT, "minimum": 0},
+           "sudo": {**_BOOL, "description": "Run perf via sudo (default false)."}},
+          ["command"]),
+    _tool("perf_record",
+          "Sample a command with `perf record` for `duration` seconds, then "
+          "stop (the command is time-boxed with `timeout`, so this is the way "
+          "to profile long-running / GUI programs like `lvglsim -b GLFW`). "
+          "Captures the call graph by default and writes perf.data on the SUT "
+          "(default /tmp/llamadbg_perf.data). Follow with perf_report / "
+          "perf_top_functions / perf_heatmap.",
+          {"command": _STR, "cwd": _STR,
+           "duration": {**_INT, "minimum": 1, "maximum": 600},
+           "frequency": {**_INT, "minimum": 1, "maximum": 100000},
+           "call_graph": _BOOL, "output": _STR,
+           "sudo": {**_BOOL, "description": "Run perf via sudo (default false)."}},
+          ["command"]),
+    _tool("perf_report",
+          "Return a text `perf report` symbol-overhead table for a perf.data "
+          "file (default /tmp/llamadbg_perf.data).",
+          {"data_file": _STR, "limit": _INT,
+           "sudo": {**_BOOL, "description": "Run perf via sudo (default false)."}}),
+    _tool("perf_top_functions",
+          "Return the hottest functions in a perf.data file as structured "
+          "JSON (percent, command, dso, kind, symbol), sorted hottest first. "
+          "Machine-readable input for perf_heatmap.",
+          {"data_file": _STR, "limit": {**_INT, "minimum": 1, "maximum": 200},
+           "sudo": {**_BOOL, "description": "Run perf via sudo (default false)."}}),
+    _tool("perf_heatmap",
+          "Render a function-level CPU heatmap PNG from a perf.data on the "
+          "SUT. Pulls the hottest functions over SSH and renders a treemap on "
+          "the HOST (tile area = self-overhead, color = blue-cold to red-hot). "
+          "Returns {png: <local path>, functions: [...], count: N}. Use after "
+          "perf_record when the user wants to SEE the profile.",
+          {"data_file": _STR, "output_png": _STR,
+           "limit": {**_INT, "minimum": 1, "maximum": 200},
+           "title": _STR,
+           "sudo": {**_BOOL, "description": "Run perf via sudo (default false)."}}),
 
     _tool("rag_search",
           "Search the local vector DB (LVGL docs + src/*.c + src/*.h + "
