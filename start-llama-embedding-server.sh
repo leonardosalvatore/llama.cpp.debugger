@@ -39,7 +39,7 @@
 #   ./start-llama-embedding-server.sh /path/to/bge-small-en-v1.5.Q8_0.gguf
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LLAMA_DIR="${SCRIPT_DIR}/../llama.cpp/llama-b8532-bin-ubuntu-rocm-7.2-x64/llama-b8532"
+LLAMA_DIR="${SCRIPT_DIR}/../llama.cpp/llama-b9940-bin-ubuntu-rocm-7.2-x64/llama-b9940"
 
 # Recommended embedding model for English MD/MDX docs (LVGL): nomic-embed-text
 # v1.5 in Q8_0. 768-dim, 8k context, ~150 MB, MTEB-strong.
